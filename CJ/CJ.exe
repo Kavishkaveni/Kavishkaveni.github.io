@@ -1,0 +1,216 @@
+// cj.cpp — Resolve UUID -> {ip, port, user, pass} then start an RDP session
+// - No .rdp file
+// - Writes a short-lived TERMSRV/<ip> credential via cmdkey
+// - Launches mstsc and deletes the temp credential
+//
+// Build tips (VS2017+):
+//  - Character Set: Use Unicode Character Set
+//  - C/C++ -> Code Generation -> Runtime Library: /MT (static)  <-- no redist
+//  - Link with: winhttp, shell32
+//
+// Usage (HOST PC):
+//   CJ.exe <uuid> <backend_host> <backend_port>
+
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <winhttp.h>
+#include <shellapi.h>
+#include <strsafe.h>
+#include <string>
+#include <vector>
+#include <cstdio>
+
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "shell32.lib")
+
+// ==== tiny logger -> C:\PAM\cj.log ====
+static void LogF(PCWSTR fmt, ...)
+{
+	CreateDirectoryW(L"C:\\PAM", nullptr);
+	wchar_t line[1024];
+	va_list ap; va_start(ap, fmt);
+	StringCchVPrintfW(line, 1024, fmt, ap);
+	va_end(ap);
+
+	SYSTEMTIME st; GetLocalTime(&st);
+	wchar_t buf[1200];
+	StringCchPrintfW(buf, 1200, L"%04u-%02u-%02u %02u:%02u:%02u [CJ] %s\r\n",
+		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line);
+
+	HANDLE h = CreateFileW(L"C:\\PAM\\cj.log", FILE_APPEND_DATA,
+		FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h != INVALID_HANDLE_VALUE) {
+		DWORD cb = (DWORD)(lstrlenW(buf) * sizeof(wchar_t));
+		WriteFile(h, buf, cb, &cb, nullptr);
+		CloseHandle(h);
+	}
+}
+
+// ==== helpers ====
+static std::wstring ToW(const std::string& s) {
+	if (s.empty()) return L"";
+	int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+	std::wstring out(n, 0);
+	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+	return out;
+}
+static std::string ToA(const std::wstring& s) {
+	if (s.empty()) return std::string();
+	int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+	std::string out(n, 0);
+	WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n, nullptr, nullptr);
+	return out;
+}
+
+// super-simple JSON pickers (we control backend)
+static std::string pickString(const std::string& body, const char* key) {
+	std::string needle = std::string("\"") + key + "\"";
+	size_t p = body.find(needle);
+	if (p == std::string::npos) return "";
+	p = body.find(':', p); if (p == std::string::npos) return "";
+	p = body.find('"', p); if (p == std::string::npos) return "";
+	size_t q = body.find('"', p + 1); if (q == std::string::npos) return "";
+	return body.substr(p + 1, q - (p + 1));
+}
+static unsigned pickU32(const std::string& body, const char* key, unsigned fallback) {
+	std::string v = pickString(body, key);
+	if (v.empty()) return fallback;
+	try { return (unsigned)std::stoul(v); }
+	catch (...) { return fallback; }
+}
+
+// HTTP GET http://host:port/cj/resolve/<uuid>
+static bool http_get(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, std::string& out)
+{
+	bool ok = false;
+	HINTERNET s = WinHttpOpen(L"CJ/1.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!s) return false;
+
+	HINTERNET c = WinHttpConnect(s, host.c_str(), port, 0);
+	if (!c) { WinHttpCloseHandle(s); return false; }
+
+	HINTERNET r = WinHttpOpenRequest(c, L"GET", path.c_str(),
+		nullptr, WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+	if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, 0, 0, 0, 0)
+		&& WinHttpReceiveResponse(r, nullptr)) {
+		for (;;) {
+			DWORD avail = 0;
+			if (!WinHttpQueryDataAvailable(r, &avail) || avail == 0) { ok = true; break; }
+			std::string chunk(avail, '\0');
+			DWORD rd = 0;
+			if (!WinHttpReadData(r, &chunk[0], avail, &rd) || rd == 0) break;
+			chunk.resize(rd);
+			out.append(chunk);
+		}
+	}
+
+	if (r) WinHttpCloseHandle(r);
+	WinHttpCloseHandle(c);
+	WinHttpCloseHandle(s);
+	return ok;
+}
+
+// run a console tool hidden: exe + command line (in place)
+static DWORD runHidden(PCWSTR exe, std::wstring& cmdline)
+{
+	STARTUPINFOW si{}; si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION pi{};
+	if (!CreateProcessW(exe, &cmdline[0], nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+		return GetLastError();
+	}
+	DWORD ec = 0;
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	GetExitCodeProcess(pi.hProcess, &ec);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return ec;
+}
+
+int wmain(int argc, wchar_t* argv[])
+{
+	if (argc < 4) {
+		wprintf(L"Usage:\n  CJ.exe <uuid> <backend_host> <backend_port>\n");
+		return 1;
+	}
+	std::wstring uuid = argv[1];
+	std::wstring host = argv[2];
+	INTERNET_PORT port = (INTERNET_PORT)_wtoi(argv[3]);
+
+	LogF(L"Start uuid=%s backend=%s port=%u", uuid.c_str(), host.c_str(), (unsigned)port);
+
+	// 1) resolve
+	std::wstring path = L"/cj/resolve/" + uuid;
+	std::string body;
+	if (!http_get(host, port, path, body)) {
+		LogF(L"HTTP request failed");
+		return 2;
+	}
+	LogF(L"JSON head: %s", ToW(body).c_str());
+
+	// 2) pull fields
+	std::string ipA = pickString(body, "target_ip");
+	unsigned   rdp = pickU32(body, "target_port", 3389);
+	std::string userA = pickString(body, "username");
+	std::string passA = pickString(body, "password");
+	if (ipA.empty() || userA.empty() || passA.empty()) {
+		LogF(L"Missing fields");
+		return 3;
+	}
+	std::wstring ip = ToW(ipA);
+	std::wstring user = ToW(userA);
+	std::wstring pass = ToW(passA);
+
+	LogF(L"Target %s:%u user=%s", ip.c_str(), rdp, user.c_str());
+
+	// 3) write temp credential for OTHER USER via cmdkey
+	//    target name must be TERMSRV/<host-or-ip>
+	wchar_t sysdir[MAX_PATH] = { 0 };
+	GetSystemDirectoryW(sysdir, MAX_PATH);
+	std::wstring cmdkeyExe = std::wstring(sysdir) + L"\\cmdkey.exe";
+
+	std::wstring target = L"TERMSRV/" + ip; // don't include :port here
+
+	std::wstring addCmd = L" /generic:" + target +
+		L" /user:\"" + user + L"\" /pass:\"" + pass + L"\"";
+	std::wstring addLine = addCmd; // CreateProcess needs a mutable buffer
+	addLine.insert(0, cmdkeyExe + L""); // exe path as part of cmdline is fine
+
+	std::wstring mutableAdd = addLine;
+	DWORD ecAdd = runHidden(cmdkeyExe.c_str(), mutableAdd);
+	if (ecAdd != 0) {
+		LogF(L"cmdkey add failed ec=%lu", ecAdd);
+		// keep going; mstsc may still prompt if this fails
+	}
+	else {
+		LogF(L"CredWrite OK target=%s user=%s", target.c_str(), user.c_str());
+	}
+
+	// 4) launch mstsc (fullscreen). No /prompt — we rely on injected creds.
+	wchar_t mstscArgs[256];
+	StringCchPrintfW(mstscArgs, 256, L"/v:%s:%u /f", ip.c_str(), rdp);
+	LogF(L"Launching: mstsc.exe %s", mstscArgs);
+	HINSTANCE h = ShellExecuteW(nullptr, L"open", L"mstsc.exe", mstscArgs, nullptr, SW_SHOW);
+	if ((INT_PTR)h <= 32) {
+		LogF(L"ShellExecute mstsc failed (%Id)", (INT_PTR)h);
+	}
+
+	// 5) give mstsc a little time to read the cached cred, then delete
+	Sleep(20000); // 20s is safe; adjust if needed
+
+	std::wstring delCmd = L" /delete:" + target;
+	std::wstring delLine = delCmd;
+	delLine.insert(0, cmdkeyExe + L"");
+	std::wstring mutableDel = delLine;
+	DWORD ecDel = runHidden(cmdkeyExe.c_str(), mutableDel);
+	if (ecDel == 0) LogF(L"CredDelete OK target=%s", target.c_str());
+	else LogF(L"CredDelete failed ec=%lu", ecDel);
+
+	LogF(L"Cleanup done");
+	return 0;
+}
