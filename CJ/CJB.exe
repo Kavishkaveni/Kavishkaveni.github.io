@@ -1,0 +1,479 @@
+// CJ.cpp — Service + TCP listener (localhost:5555) for UUIDs from CCP, plus CLI test mode.
+// - Service installs with: CJ.exe --install <backend_host> <backend_port> [listen_port=5555]
+// - Service removes with:  CJ.exe --uninstall
+// - Service runs with:    CJ.exe --service   (SCM calls this automatically)
+// - CLI (manual test):    CJ.exe <uuid> <backend_host> <backend_port>
+//
+// Build:
+//  - VS2017 or later, Unicode, /MT
+//  - Link: winhttp, shell32, advapi32, ws2_32
+//
+// Behavior:
+//  - On install, shows a simple EULA prompt once. Stores config in HKLM\Software\QCM\CJ
+//  - Service listens on 127.0.0.1:<listen_port> (default 5555). Each line = a UUID.
+//  - For each UUID: call backend /cj/resolve/<uuid>, get target_ip/port/user/pass,
+//    write temp TERMSRV/<ip> credential via cmdkey, launch mstsc, then delete after 20s.
+//  - No .rdp file is ever created.
+// ---- put this block at the very top of cj.cpp ----
+#ifndef _NO_INIT_ALL
+#define _NO_INIT_ALL 1           // silence unsupported [[no_init_all]] in older toolsets
+#endif
+
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+#include <winhttp.h>
+#include <shellapi.h>
+#include <shlwapi.h>             // for SHDeleteKeyW  (or switch to RegDeleteTreeW)
+#include <strsafe.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <string>
+#include <vector>
+#include <cstdio>
+
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shlwapi.lib")  // needed for SHDeleteKeyW
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ws2_32.lib")
+// ---- end top block ----
+
+// ---------------- constants ----------------
+static const wchar_t* kServiceName = L"QCM-CJ";
+static const wchar_t* kServiceDisp = L"QCM Credential Joiner";
+static const wchar_t* kRegKey = L"SOFTWARE\\QCM\\CJ";
+static const wchar_t* kRegHost = L"BackendHost";
+static const wchar_t* kRegPort = L"BackendPort";
+static const wchar_t* kRegListen = L"ListenPort";
+static const wchar_t* kRegEula = L"EulaAccepted";
+static const wchar_t* kLogDir = L"C:\\PAM";
+static const wchar_t* kLogPath = L"C:\\PAM\\cj.log";
+
+// -------------- tiny logger ---------------
+static void LogF(PCWSTR fmt, ...)
+{
+	CreateDirectoryW(kLogDir, nullptr);
+	wchar_t line[1024];
+	va_list ap; va_start(ap, fmt);
+	StringCchVPrintfW(line, 1024, fmt, ap);
+	va_end(ap);
+
+	SYSTEMTIME st; GetLocalTime(&st);
+	wchar_t buf[1200];
+	StringCchPrintfW(buf, 1200, L"%04u-%02u-%02u %02u:%02u:%02u [CJ] %s\r\n",
+		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line);
+
+	HANDLE h = CreateFileW(kLogPath, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+		OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h != INVALID_HANDLE_VALUE) {
+		DWORD cb = (DWORD)(lstrlenW(buf) * sizeof(wchar_t));
+		WriteFile(h, buf, cb, &cb, nullptr);
+		CloseHandle(h);
+	}
+}
+
+// -------------- helpers -------------------
+static std::wstring ToW(const std::string& s) {
+	if (s.empty()) return L"";
+	int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+	std::wstring out(n, 0);
+	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n);
+	return out;
+}
+static std::string ToA(const std::wstring& s) {
+	if (s.empty()) return std::string();
+	int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+	std::string out(n, 0);
+	WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], n, nullptr, nullptr);
+	return out;
+}
+
+// super-small JSON pickers (backend is trusted)
+static std::string pickString(const std::string& body, const char* key) {
+	std::string needle = std::string("\"") + key + "\"";
+	size_t p = body.find(needle);
+	if (p == std::string::npos) return "";
+	p = body.find(':', p); if (p == std::string::npos) return "";
+	p = body.find('"', p); if (p == std::string::npos) return "";
+	size_t q = body.find('"', p + 1); if (q == std::string::npos) return "";
+	return body.substr(p + 1, q - (p + 1));
+}
+static unsigned pickU32(const std::string& body, const char* key, unsigned fallback) {
+	std::string v = pickString(body, key);
+	if (v.empty()) return fallback;
+	try { return (unsigned)std::stoul(v); }
+	catch (...) { return fallback; }
+}
+
+// HTTP GET http://host:port/cj/resolve/<uuid>
+static bool http_get(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, std::string& out)
+{
+	bool ok = false;
+	HINTERNET s = WinHttpOpen(L"CJ/1.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!s) return false;
+
+	HINTERNET c = WinHttpConnect(s, host.c_str(), port, 0);
+	if (!c) { WinHttpCloseHandle(s); return false; }
+
+	HINTERNET r = WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+	if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, 0, 0, 0, 0)
+		&& WinHttpReceiveResponse(r, nullptr)) {
+		for (;;) {
+			DWORD avail = 0;
+			if (!WinHttpQueryDataAvailable(r, &avail) || avail == 0) { ok = true; break; }
+			std::string chunk(avail, '\0');
+			DWORD rd = 0;
+			if (!WinHttpReadData(r, &chunk[0], avail, &rd) || rd == 0) break;
+			chunk.resize(rd);
+			out.append(chunk);
+		}
+	}
+
+	if (r) WinHttpCloseHandle(r);
+	WinHttpCloseHandle(c);
+	WinHttpCloseHandle(s);
+	return ok;
+}
+
+// run console tool hidden
+static DWORD runHidden(PCWSTR exe, std::wstring& cmdline)
+{
+	STARTUPINFOW si{}; si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION pi{};
+	if (!CreateProcessW(exe, &cmdline[0], nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+		return GetLastError();
+	}
+	DWORD ec = 0;
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	GetExitCodeProcess(pi.hProcess, &ec);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return ec;
+}
+
+// resolve + inject + launch mstsc (core action)
+static bool handle_uuid(const std::wstring& uuid, const std::wstring& host, INTERNET_PORT port)
+{
+	LogF(L"Handle UUID=%s backend=%s:%u", uuid.c_str(), host.c_str(), (unsigned)port);
+
+	// resolve
+	std::wstring path = L"/cj/resolve/" + uuid;
+	std::string body;
+	if (!http_get(host, port, path, body)) {
+		LogF(L"HTTP request failed");
+		return false;
+	}
+	LogF(L"JSON: %s", ToW(body).c_str());
+
+	// parse
+	std::string ipA = pickString(body, "target_ip");
+	unsigned   rdp = pickU32(body, "target_port", 3389);
+	std::string userA = pickString(body, "username");
+	std::string passA = pickString(body, "password");
+	if (ipA.empty() || userA.empty() || passA.empty()) {
+		LogF(L"Missing fields from backend");
+		return false;
+	}
+	std::wstring ip = ToW(ipA), user = ToW(userA), pass = ToW(passA);
+	LogF(L"Target %s:%u user=%s", ip.c_str(), rdp, user.c_str());
+
+	// cmdkey add
+	wchar_t sysdir[MAX_PATH] = { 0 };
+	GetSystemDirectoryW(sysdir, MAX_PATH);
+	std::wstring cmdkeyExe = std::wstring(sysdir) + L"\\cmdkey.exe";
+
+	std::wstring target = L"TERMSRV/" + ip; // no :port
+	std::wstring addCmd = L" " L"/generic:" + target +
+		L" /user:\"" + user + L"\" /pass:\"" + pass + L"\"";
+	std::wstring addLine = cmdkeyExe + addCmd; // mutable for CreateProcess
+	std::wstring mutableAdd = addLine;
+	DWORD ecAdd = runHidden(cmdkeyExe.c_str(), mutableAdd);
+	if (ecAdd != 0) LogF(L"cmdkey add failed ec=%lu", ecAdd);
+	else            LogF(L"CredWrite OK target=%s user=%s", target.c_str(), user.c_str());
+
+	// launch mstsc
+	wchar_t mstscArgs[256];
+	StringCchPrintfW(mstscArgs, 256, L"/v:%s:%u /f", ip.c_str(), rdp);
+	LogF(L"Launching mstsc %s", mstscArgs);
+	HINSTANCE h = ShellExecuteW(nullptr, L"open", L"mstsc.exe", mstscArgs, nullptr, SW_SHOW);
+	if ((INT_PTR)h <= 32) LogF(L"ShellExecute mstsc failed (%Id)", (INT_PTR)h);
+
+	// cleanup
+	Sleep(20000);
+	std::wstring delCmd = std::wstring(L" ") + L"/delete:" + target;
+	std::wstring delLine = cmdkeyExe + delCmd;
+	std::wstring mutableDel = delLine;
+	DWORD ecDel = runHidden(cmdkeyExe.c_str(), mutableDel);
+	if (ecDel == 0) LogF(L"CredDelete OK target=%s", target.c_str());
+	else            LogF(L"CredDelete failed ec=%lu", ecDel);
+
+	LogF(L"Done");
+	return true;
+}
+
+// ----------------- registry config -----------------
+static bool RegWriteStr(HKEY root, const wchar_t* path, const wchar_t* name, const std::wstring& val) {
+	HKEY h; if (RegCreateKeyExW(root, path, 0, nullptr, 0, KEY_WRITE, nullptr, &h, nullptr) != ERROR_SUCCESS) return false;
+	DWORD cb = (DWORD)((val.size() + 1) * sizeof(wchar_t));
+	LONG r = RegSetValueExW(h, name, 0, REG_SZ, (const BYTE*)val.c_str(), cb);
+	RegCloseKey(h); return r == ERROR_SUCCESS;
+}
+static bool RegWriteU32(HKEY root, const wchar_t* path, const wchar_t* name, DWORD v) {
+	HKEY h; if (RegCreateKeyExW(root, path, 0, nullptr, 0, KEY_WRITE, nullptr, &h, nullptr) != ERROR_SUCCESS) return false;
+	LONG r = RegSetValueExW(h, name, 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+	RegCloseKey(h); return r == ERROR_SUCCESS;
+}
+static bool RegReadStr(HKEY root, const wchar_t* path, const wchar_t* name, std::wstring& out) {
+	HKEY h; if (RegOpenKeyExW(root, path, 0, KEY_READ, &h) != ERROR_SUCCESS) return false;
+	DWORD type = 0, cb = 0;
+	if (RegQueryValueExW(h, name, 0, &type, nullptr, &cb) != ERROR_SUCCESS || type != REG_SZ) { RegCloseKey(h); return false; }
+	std::vector<wchar_t> buf(cb / sizeof(wchar_t) + 1, 0);
+	if (RegQueryValueExW(h, name, 0, &type, (BYTE*)buf.data(), &cb) != ERROR_SUCCESS) { RegCloseKey(h); return false; }
+	RegCloseKey(h); out.assign(buf.data()); return true;
+}
+static bool RegReadU32(HKEY root, const wchar_t* path, const wchar_t* name, DWORD& out) {
+	HKEY h; if (RegOpenKeyExW(root, path, 0, KEY_READ, &h) != ERROR_SUCCESS) return false;
+	DWORD type = 0, cb = sizeof(DWORD); DWORD v = 0;
+	if (RegQueryValueExW(h, name, 0, &type, (BYTE*)&v, &cb) != ERROR_SUCCESS || type != REG_DWORD) { RegCloseKey(h); return false; }
+	RegCloseKey(h); out = v; return true;
+}
+
+// ----------------- service stuff -------------------
+static SERVICE_STATUS_HANDLE gSsh = nullptr;
+static HANDLE gStopEvent = nullptr;
+
+static void WINAPI SvcCtrlHandler(DWORD code) {
+	if (code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN) {
+		if (gStopEvent) SetEvent(gStopEvent);
+		SERVICE_STATUS ss{}; ss.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+		ss.dwCurrentState = SERVICE_STOP_PENDING;
+		ss.dwControlsAccepted = 0;
+		SetServiceStatus(gSsh, &ss);
+	}
+}
+
+static void ListenLoop(const std::wstring& host, INTERNET_PORT backendPort, u_short listenPort)
+{
+	WSADATA wsa; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { LogF(L"WSAStartup failed"); return; }
+
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == INVALID_SOCKET) { LogF(L"socket failed"); WSACleanup(); return; }
+
+	sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons(listenPort);
+	if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+		LogF(L"bind 127.0.0.1:%u failed (%d)", (unsigned)listenPort, WSAGetLastError());
+		closesocket(s); WSACleanup(); return;
+	}
+	if (listen(s, 5) == SOCKET_ERROR) {
+		LogF(L"listen failed (%d)", WSAGetLastError());
+		closesocket(s); WSACleanup(); return;
+	}
+
+	LogF(L"Listening on 127.0.0.1:%u", (unsigned)listenPort);
+
+	fd_set readfds;
+	timeval tv{};
+	while (WaitForSingleObject(gStopEvent, 50) == WAIT_TIMEOUT) {
+		FD_ZERO(&readfds);
+		FD_SET(s, &readfds);
+		tv.tv_sec = 0; tv.tv_usec = 100000; // 100ms
+		int r = select(0, &readfds, nullptr, nullptr, &tv);
+		if (r > 0 && FD_ISSET(s, &readfds)) {
+			sockaddr_in cli{}; int len = sizeof(cli);
+			SOCKET c = accept(s, (sockaddr*)&cli, &len);
+			if (c == INVALID_SOCKET) continue;
+
+			// simple line read
+			std::string line; line.reserve(128);
+			char buf[256];
+			for (;;) {
+				int n = recv(c, buf, sizeof(buf), 0);
+				if (n <= 0) break;
+				line.append(buf, buf + n);
+				size_t pos = line.find('\n');
+				if (pos != std::string::npos) { line.resize(pos); break; }
+			}
+			closesocket(c);
+
+			// trim spaces
+			size_t a = line.find_first_not_of(" \t\r");
+			size_t b = line.find_last_not_of(" \t\r");
+			std::string uuidA = (a == std::string::npos) ? "" : line.substr(a, b - a + 1);
+			std::wstring uuid = ToW(uuidA);
+
+			if (!uuid.empty()) {
+				LogF(L"Received UUID: %s", uuid.c_str());
+				handle_uuid(uuid, host, backendPort);
+			}
+		}
+	}
+
+	closesocket(s);
+	WSACleanup();
+	LogF(L"Listener stopped");
+}
+
+static void WINAPI SvcMain(DWORD, LPWSTR*)
+{
+	gSsh = RegisterServiceCtrlHandlerW(kServiceName, SvcCtrlHandler);
+	if (!gSsh) return;
+
+	SERVICE_STATUS ss{}; ss.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+	ss.dwCurrentState = SERVICE_START_PENDING;
+	ss.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+	SetServiceStatus(gSsh, &ss);
+
+	gStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+	// load config
+	std::wstring host; DWORD bport = 0, lport = 0;
+	if (!RegReadStr(HKEY_LOCAL_MACHINE, kRegKey, kRegHost, host) ||
+		!RegReadU32(HKEY_LOCAL_MACHINE, kRegKey, kRegPort, bport) ||
+		!RegReadU32(HKEY_LOCAL_MACHINE, kRegKey, kRegListen, lport)) {
+		LogF(L"Config missing in registry");
+	}
+	else {
+		LogF(L"Service starting: backend=%s:%u listen=127.0.0.1:%u", host.c_str(), (unsigned)bport, (unsigned)lport);
+	}
+
+	ss.dwCurrentState = SERVICE_RUNNING;
+	SetServiceStatus(gSsh, &ss);
+
+	// run listener
+	ListenLoop(host, (INTERNET_PORT)bport, (u_short)lport);
+
+	ss.dwCurrentState = SERVICE_STOPPED;
+	ss.dwControlsAccepted = 0;
+	SetServiceStatus(gSsh, &ss);
+}
+
+// ----------------- install/uninstall ----------------
+static bool InstallService(const std::wstring& host, DWORD port, DWORD listenPort)
+{
+	// EULA prompt (only at install time; services can't show UI)
+	int r = MessageBoxW(nullptr,
+		L"QCM CJ — Terms & Conditions\n\n"
+		L"This software initiates remote desktop sessions on your Jump Host based on UUIDs.\n"
+		L"By clicking OK you agree to proceed.",
+		L"QCM CJ Installer", MB_OKCANCEL | MB_ICONINFORMATION);
+	if (r != IDOK) return false;
+
+	// write config
+	if (!RegWriteStr(HKEY_LOCAL_MACHINE, kRegKey, kRegHost, host) ||
+		!RegWriteU32(HKEY_LOCAL_MACHINE, kRegKey, kRegPort, port) ||
+		!RegWriteU32(HKEY_LOCAL_MACHINE, kRegKey, kRegListen, listenPort) ||
+		!RegWriteU32(HKEY_LOCAL_MACHINE, kRegKey, kRegEula, 1)) {
+		MessageBoxW(nullptr, L"Failed to write registry settings.", L"CJ Installer", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	wchar_t path[MAX_PATH];
+	GetModuleFileNameW(nullptr, path, MAX_PATH);
+	std::wstring bin = L"\""; bin += path; bin += L"\" --service";
+
+	SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+	if (!scm) { MessageBoxW(nullptr, L"OpenSCManager failed.", L"CJ Installer", MB_OK | MB_ICONERROR); return false; }
+
+	SC_HANDLE svc = CreateServiceW(
+		scm, kServiceName, kServiceDisp,
+		SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+		SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+		bin.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
+
+	if (!svc) {
+		DWORD gle = GetLastError();
+		CloseServiceHandle(scm);
+		wchar_t msg[256]; StringCchPrintfW(msg, 256, L"CreateService failed GLE=%lu", gle);
+		MessageBoxW(nullptr, msg, L"CJ Installer", MB_OK | MB_ICONERROR);
+		return false;
+	}
+
+	bool ok = (StartServiceW(svc, 0, nullptr) != 0);
+	CloseServiceHandle(svc);
+	CloseServiceHandle(scm);
+
+	if (!ok) MessageBoxW(nullptr, L"Service created but failed to start. Start it from Services.msc.", L"CJ Installer", MB_OK | MB_ICONWARNING);
+	else MessageBoxW(nullptr, L"Service installed and started.", L"CJ Installer", MB_OK | MB_ICONINFORMATION);
+
+	LogF(L"Installed service. backend=%s:%u listen=%u", host.c_str(), (unsigned)port, (unsigned)listenPort);
+	return true;
+}
+
+static bool UninstallService()
+{
+	SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+	if (!scm) return false;
+	SC_HANDLE svc = OpenServiceW(scm, kServiceName, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+	if (!svc) { CloseServiceHandle(scm); return false; }
+
+	SERVICE_STATUS ss{};
+	ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+	DeleteService(svc);
+	CloseServiceHandle(svc);
+	CloseServiceHandle(scm);
+
+	SHDeleteKeyW(HKEY_LOCAL_MACHINE, kRegKey); // remove config
+	LogF(L"Uninstalled service and deleted config");
+	return true;
+}
+
+// ----------------- main -------------------
+int wmain(int argc, wchar_t* argv[])
+{
+	// CLI test mode: CJ.exe <uuid> <backend_host> <backend_port>
+	if (argc == 4 && wcscmp(argv[1], L"--install") != 0 && wcscmp(argv[1], L"--uninstall") != 0 && wcscmp(argv[1], L"--service") != 0) {
+		std::wstring uuid = argv[1];
+		std::wstring host = argv[2];
+		INTERNET_PORT port = (INTERNET_PORT)_wtoi(argv[3]);
+		LogF(L"CLI start uuid=%s backend=%s port=%u", uuid.c_str(), host.c_str(), (unsigned)port);
+		handle_uuid(uuid, host, port);
+		return 0;
+	}
+
+	// install
+	if (argc >= 3 && wcscmp(argv[1], L"--install") == 0) {
+		if (argc < 4) {
+			wprintf(L"Usage:\n  CJ.exe --install <backend_host> <backend_port> [listen_port=5555]\n");
+			return 1;
+		}
+		std::wstring host = argv[2];
+		DWORD bport = (DWORD)_wtoi(argv[3]);
+		DWORD lport = (argc >= 5) ? (DWORD)_wtoi(argv[4]) : 5555;
+		if (!InstallService(host, bport, lport)) return 2;
+		return 0;
+	}
+
+	// uninstall
+	if (argc >= 2 && wcscmp(argv[1], L"--uninstall") == 0) {
+		if (!UninstallService()) return 2;
+		return 0;
+	}
+
+	// service entry
+	if (argc >= 2 && wcscmp(argv[1], L"--service") == 0) {
+		SERVICE_TABLE_ENTRYW ste[] = {
+			{ (LPWSTR)kServiceName, (LPSERVICE_MAIN_FUNCTIONW)SvcMain },
+			{ nullptr, nullptr }
+		};
+		StartServiceCtrlDispatcherW(ste);
+		return 0;
+	}
+
+	// help
+	wprintf(L"Usage:\n"
+		L"  CJ.exe --install <backend_host> <backend_port> [listen_port=5555]\n"
+		L"  CJ.exe --uninstall\n"
+		L"  (Service will run as: CJ.exe --service)\n"
+		L"  \n"
+		L"Manual test:\n"
+		L"  CJ.exe <uuid> <backend_host> <backend_port>\n");
+	return 0;
+}
