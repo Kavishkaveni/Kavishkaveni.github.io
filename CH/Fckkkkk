@@ -1,0 +1,293 @@
+// qcm_ch_service.cpp  — Windows Service wrapper that runs Rust CH in the ACTIVE RDP session
+// Build: Release x64, Unicode
+// Linker: Advapi32.lib; Userenv.lib; Wtsapi32.lib; Shell32.lib
+
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <wtsapi32.h>
+#include <userenv.h>
+#include <tlhelp32.h>
+#include <strsafe.h>
+
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Userenv.lib")
+#pragma comment(lib, "Wtsapi32.lib")
+#pragma comment(lib, "Shell32.lib")
+
+// ------------ config ---------------------------------------------------------
+static const wchar_t* kSvcName   = L"QCM-CH";
+static const wchar_t* kSvcDisp   = L"QCM Chrome AutoLogin Service";
+static const wchar_t* kRustExe   = L"C:\\PAM\\qcm_autologin_service.exe";
+static const wchar_t* kRustArgs  = L" --port 10443 --log-dir C:\\PAM\\logs";
+static const wchar_t* kWorkDir   = L"C:\\PAM";
+static const int       kPollMs   = 1000;   // poll for active RDP session
+static const int       kWaitUser = 15000;  // wait up to 15s total for an active RDP session at start
+
+// ------------ logging --------------------------------------------------------
+static void LogF(PCWSTR fmt, ...)
+{
+    CreateDirectoryW(L"C:\\PAM", nullptr);
+    wchar_t line[2048];
+    va_list ap; va_start(ap, fmt);
+    StringCchVPrintfW(line, _countof(line), fmt, ap);
+    va_end(ap);
+
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t msg[2300];
+    StringCchPrintfW(msg, _countof(msg),
+        L"%04u-%02u-%02u %02u:%02u:%02u [CH-WRAPPER] %s\r\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line);
+
+    HANDLE h = CreateFileW(L"C:\\PAM\\ch-wrapper.log", FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD cb = (DWORD)(lstrlenW(msg) * sizeof(wchar_t));
+        WriteFile(h, msg, cb, &cb, nullptr);
+        CloseHandle(h);
+    }
+}
+
+// ------------ service globals ------------------------------------------------
+static SERVICE_STATUS_HANDLE gSsh = nullptr;
+static SERVICE_STATUS gSs{};
+static HANDLE gStopEvent = nullptr;
+static HANDLE gChildProc = nullptr;
+static DWORD  gChildPid = 0;
+static DWORD  gChildSession = 0xFFFFFFFF;
+
+// ------------ helpers --------------------------------------------------------
+static void SetState(DWORD s, DWORD win32 = NO_ERROR, DWORD waitHintMs = 0)
+{
+    gSs.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    gSs.dwCurrentState = s;
+    gSs.dwWin32ExitCode = win32;
+    gSs.dwControlsAccepted = (s == SERVICE_START_PENDING) ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+    gSs.dwWaitHint = waitHintMs;
+    SetServiceStatus(gSsh, &gSs);
+}
+
+static DWORD GetActiveRdpSession()
+{
+    PWTS_SESSION_INFO pInfo = nullptr;
+    DWORD count = 0;
+    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pInfo, &count)) {
+        LogF(L"WTSEnumerateSessionsW failed ec=%lu", GetLastError());
+        return (DWORD)-1;
+    }
+
+    DWORD result = (DWORD)-1;
+    for (DWORD i = 0; i < count; ++i) {
+        DWORD sid = pInfo[i].SessionId;
+
+        // state
+        DWORD bytes = 0;
+        WTS_CONNECTSTATE_CLASS* pState = nullptr;
+        if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sid, WTSConnectState, (LPWSTR*)&pState, &bytes) || !pState) {
+            if (pState) WTSFreeMemory(pState);
+            continue;
+        }
+        WTS_CONNECTSTATE_CLASS state = *pState;
+        WTSFreeMemory(pState);
+
+        // protocol
+        LPWSTR pProto = nullptr;
+        int proto = 0;
+        if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sid, WTSClientProtocolType, (LPWSTR*)&pProto, &bytes) && pProto) {
+            proto = *(USHORT*)pProto;
+            WTSFreeMemory(pProto);
+        }
+
+        if (state == WTSActive && proto == 2 /*RDP*/) {
+            result = sid;
+            break;
+        }
+    }
+    WTSFreeMemory(pInfo);
+    return result;
+}
+
+static void KillProcessTree(HANDLE hProcess)
+{
+    if (!hProcess) return;
+    DWORD pid = GetProcessId(hProcess);
+    if (!pid) return;
+
+    // try terminate main
+    TerminateProcess(hProcess, 0);
+
+    // kill children
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{ sizeof(pe) };
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ParentProcessID == pid) {
+                    HANDLE ch = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if (ch) { TerminateProcess(ch, 0); CloseHandle(ch); }
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+}
+
+static HANDLE LaunchRustCHInSession(DWORD sessionId)
+{
+    HANDLE hUser = nullptr;
+    if (!WTSQueryUserToken(sessionId, &hUser)) {
+        LogF(L"WTSQueryUserToken failed sess=%u ec=%lu", (unsigned)sessionId, GetLastError());
+        return nullptr;
+    }
+
+    HANDLE hPrimary = nullptr;
+    if (!DuplicateTokenEx(hUser, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &hPrimary)) {
+        LogF(L"DuplicateTokenEx failed ec=%lu", GetLastError());
+        CloseHandle(hUser);
+        return nullptr;
+    }
+    CloseHandle(hUser);
+
+    LPVOID env = nullptr;
+    if (!CreateEnvironmentBlock(&env, hPrimary, FALSE)) {
+        LogF(L"CreateEnvironmentBlock failed ec=%lu (continuing w/o env)", GetLastError());
+        env = nullptr;
+    }
+
+    wchar_t cmd[1024];
+    StringCchPrintfW(cmd, 1024, L"\"%s\"%s", kRustExe, kRustArgs);
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessAsUserW(
+        hPrimary,
+        kRustExe,
+        cmd,
+        nullptr, nullptr, FALSE,
+        CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+        env,
+        kWorkDir,
+        &si, &pi
+    );
+
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(hPrimary);
+
+    if (!ok) {
+        LogF(L"CreateProcessAsUserW failed ec=%lu (sess=%u, exe=%s)", GetLastError(), (unsigned)sessionId, kRustExe);
+        return nullptr;
+    }
+
+    CloseHandle(pi.hThread);
+    gChildPid = pi.dwProcessId;
+    gChildSession = sessionId;
+    LogF(L"Launched Rust CH in session %u, PID %lu", (unsigned)sessionId, (unsigned long)gChildPid);
+    return pi.hProcess; // caller owns
+}
+
+// ------------ worker loop ----------------------------------------------------
+static DWORD WINAPI Worker(LPVOID)
+{
+    CreateDirectoryW(L"C:\\PAM\\logs", nullptr);
+    LogF(L"Service worker start");
+
+    // optional: wait a bit for an RDP session on boot
+    DWORD waited = 0;
+    while (waited < (DWORD)kWaitUser && WaitForSingleObject(gStopEvent, 0) != WAIT_OBJECT_0) {
+        DWORD sid = GetActiveRdpSession();
+        if (sid != (DWORD)-1) break;
+        Sleep(500);
+        waited += 500;
+    }
+
+    for (;;) {
+        if (WaitForSingleObject(gStopEvent, kPollMs) == WAIT_OBJECT_0)
+            break;
+
+        DWORD activeSid = GetActiveRdpSession();
+
+        // child died?
+        if (gChildProc) {
+            DWORD code = 0;
+            if (GetExitCodeProcess(gChildProc, &code) && code != STILL_ACTIVE) {
+                LogF(L"Rust CH exited code=%lu (sess=%u). Will relaunch if session active.",
+                     (unsigned long)code, (unsigned)gChildSession);
+                CloseHandle(gChildProc); gChildProc = nullptr; gChildPid = 0;
+            }
+        }
+
+        // session changed?
+        if (activeSid != (DWORD)-1) {
+            if (!gChildProc || gChildSession != activeSid) {
+                // stop old child if running in wrong session
+                if (gChildProc) {
+                    LogF(L"Active session changed %u -> %u, stopping old child", (unsigned)gChildSession, (unsigned)activeSid);
+                    KillProcessTree(gChildProc);
+                    CloseHandle(gChildProc); gChildProc = nullptr; gChildPid = 0;
+                }
+                LogF(L"Active RDP session found: %u", (unsigned)activeSid);
+                gChildProc = LaunchRustCHInSession(activeSid);
+                if (!gChildProc) {
+                    LogF(L"Launch failed; will retry");
+                }
+            }
+        } else {
+            // no active RDP; ensure child is not running
+            if (gChildProc) {
+                LogF(L"No ACTIVE RDP session; stopping child");
+                KillProcessTree(gChildProc);
+                CloseHandle(gChildProc); gChildProc = nullptr; gChildPid = 0;
+            }
+        }
+    }
+
+    if (gChildProc) {
+        LogF(L"Stop requested: terminating child");
+        KillProcessTree(gChildProc);
+        CloseHandle(gChildProc); gChildProc = nullptr; gChildPid = 0;
+    }
+    LogF(L"Service worker exit");
+    return 0;
+}
+
+// ------------ service plumbing ----------------------------------------------
+static void WINAPI CtrlHandler(DWORD ctrl)
+{
+    if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
+        SetEvent(gStopEvent);
+        SetState(SERVICE_STOP_PENDING, NO_ERROR, 4000);
+    }
+}
+
+static void WINAPI SvcMain(DWORD, LPWSTR*)
+{
+    gSsh = RegisterServiceCtrlHandlerW(kSvcName, CtrlHandler);
+    if (!gSsh) return;
+
+    SetState(SERVICE_START_PENDING, NO_ERROR, 4000);
+
+    gStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+
+    SetState(SERVICE_RUNNING);
+
+    WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
+    CloseHandle(gStopEvent); gStopEvent = nullptr;
+
+    SetState(SERVICE_STOPPED);
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
+{
+    SERVICE_TABLE_ENTRYW ste[] = {
+        { (LPWSTR)kSvcName, SvcMain },
+        { nullptr, nullptr }
+    };
+    StartServiceCtrlDispatcherW(ste);
+    return 0;
+}
