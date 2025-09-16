@@ -1,0 +1,142 @@
+// ch_service.cpp - Windows Service wrapper for Rust CH (qcm_autologin_service.exe)
+// Build: Release x64, Unicode; Linker -> Input -> Advapi32.lib
+
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <strsafe.h>
+#include <tlhelp32.h>
+
+static const wchar_t* kSvcName = L"QCM-CH";
+static const wchar_t* kSvcDisp = L"QCM Chrome AutoLogin Service";
+static SERVICE_STATUS_HANDLE gSsh = nullptr;
+static SERVICE_STATUS gSs{};
+static HANDLE gChildProc = nullptr;
+static HANDLE gStopEvent = nullptr;
+
+// ---- small helpers ---------------------------------------------------------
+static void SetState(DWORD s, DWORD win32 = NO_ERROR, DWORD waitHintMs = 0) {
+    gSs.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    gSs.dwCurrentState = s;
+    gSs.dwWin32ExitCode = win32;
+    gSs.dwControlsAccepted = (s == SERVICE_START_PENDING) ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+    gSs.dwWaitHint = waitHintMs;
+    SetServiceStatus(gSsh, &gSs);
+}
+
+static void KillProcessTree(HANDLE hProcess) {
+    if (!hProcess) return;
+    DWORD pid = 0;
+    GetProcessId(hProcess) ? (pid = GetProcessId(hProcess)) : 0;
+    if (!pid) return;
+
+    // try gentle first
+    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+    TerminateProcess(hProcess, 0);
+
+    // just in case: kill children
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{ sizeof(pe) };
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ParentProcessID == pid) {
+                    HANDLE ch = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if (ch) { TerminateProcess(ch, 0); CloseHandle(ch); }
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+}
+
+static HANDLE LaunchRustCH() {
+    // Adjust this path/args if your exe is elsewhere
+    const wchar_t* exePath = L"C:\\PAM\\qcm_autologin_service.exe";
+    const wchar_t* args    = L" --port 10443 --log-dir C:\\PAM\\logs";
+
+    wchar_t cmd[1024];
+    StringCchPrintfW(cmd, 1024, L"\"%s\"%s", exePath, args);
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(
+        exePath, cmd,
+        nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+        nullptr, L"C:\\PAM", &si, &pi
+    );
+    if (!ok) return nullptr;
+
+    CloseHandle(pi.hThread);
+    return pi.hProcess; // caller closes
+}
+
+// ---- service worker --------------------------------------------------------
+static DWORD WINAPI Worker(LPVOID) {
+    // ensure log dir exists
+    CreateDirectoryW(L"C:\\PAM", nullptr);
+    CreateDirectoryW(L"C:\\PAM\\logs", nullptr);
+
+    for (;;) {
+        if (WaitForSingleObject(gStopEvent, 0) == WAIT_OBJECT_0) break;
+
+        // start child if not running
+        if (!gChildProc) {
+            gChildProc = LaunchRustCH();
+        }
+
+        // wait child or stop
+        HANDLE waitHandles[2] = { gStopEvent, gChildProc ? gChildProc : gStopEvent };
+        DWORD wr = WaitForMultipleObjects(gChildProc ? 2 : 1, waitHandles, FALSE, 1000);
+        if (wr == WAIT_OBJECT_0) {
+            // stop requested
+            if (gChildProc) { KillProcessTree(gChildProc); CloseHandle(gChildProc); gChildProc = nullptr; }
+            break;
+        }
+        if (wr == WAIT_OBJECT_0 + 1) {
+            // child exited, restart loop
+            if (gChildProc) { CloseHandle(gChildProc); gChildProc = nullptr; }
+            Sleep(1500); // small backoff before restart
+        }
+        // else timeout, continue
+    }
+
+    if (gChildProc) { KillProcessTree(gChildProc); CloseHandle(gChildProc); gChildProc = nullptr; }
+    return 0;
+}
+
+// ---- SCM plumbing ----------------------------------------------------------
+static void WINAPI CtrlHandler(DWORD ctrl) {
+    if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
+        SetEvent(gStopEvent);
+        SetState(SERVICE_STOP_PENDING, NO_ERROR, 4000);
+    }
+}
+
+static void WINAPI SvcMain(DWORD, LPWSTR*) {
+    gSsh = RegisterServiceCtrlHandlerW(kSvcName, CtrlHandler);
+    if (!gSsh) return;
+
+    SetState(SERVICE_START_PENDING, NO_ERROR, 4000);
+
+    gStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+
+    SetState(SERVICE_RUNNING);
+
+    WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
+    CloseHandle(gStopEvent); gStopEvent = nullptr;
+
+    SetState(SERVICE_STOPPED);
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
+    SERVICE_TABLE_ENTRYW ste[] = {
+        { (LPWSTR)kSvcName, SvcMain },
+        { nullptr, nullptr }
+    };
+    StartServiceCtrlDispatcherW(ste);
+    return 0;
+}
