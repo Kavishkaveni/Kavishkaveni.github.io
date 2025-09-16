@@ -1,0 +1,271 @@
+// QCM-CH.cpp  — Windows Service wrapper for Rust CH (qcm_autologin_service.exe)
+// Build: Release x64, Unicode; Subsystem = Windows (/SUBSYSTEM:WINDOWS)
+// Linker -> Input: Advapi32.lib; Wtsapi32.lib; Userenv.lib
+// Output: Service name = "QCM-CH" (Display: QCM Chrome AutoLogin Service)
+
+#define UNICODE
+#define _UNICODE
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
+#include <strsafe.h>
+#include <tlhelp32.h>
+#include <wtsapi32.h>
+#include <userenv.h>
+
+#pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Wtsapi32.lib")
+#pragma comment(lib, "Userenv.lib")
+
+// ----------------- service id -----------------
+static const wchar_t* kSvcName = L"QCM-CH";
+static const wchar_t* kSvcDisp = L"QCM Chrome AutoLogin Service";
+
+// ----------------- globals --------------------
+static SERVICE_STATUS_HANDLE gSsh = nullptr;
+static SERVICE_STATUS gSs{};
+static HANDLE gStopEvent = nullptr;
+static HANDLE gChildProc = nullptr;
+
+// ----------------- tiny logger ----------------
+static void LogF(PCWSTR fmt, ...)
+{
+    CreateDirectoryW(L"C:\\PAM", nullptr);
+    wchar_t line[2048];
+    va_list ap; va_start(ap, fmt);
+    StringCchVPrintfW(line, _countof(line), fmt, ap);
+    va_end(ap);
+
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t msg[2300];
+    StringCchPrintfW(msg, _countof(msg),
+        L"%04u-%02u-%02u %02u:%02u:%02u [CH-WRAP] %s\r\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line);
+
+    HANDLE h = CreateFileW(L"C:\\PAM\\ch_wrapper.log", FILE_APPEND_DATA, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD cb = (DWORD)(lstrlenW(msg) * sizeof(wchar_t));
+        WriteFile(h, msg, cb, &cb, nullptr);
+        CloseHandle(h);
+    }
+}
+
+// ----------------- service state --------------
+static void SetState(DWORD s, DWORD win32 = NO_ERROR, DWORD waitHintMs = 0)
+{
+    gSs.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    gSs.dwCurrentState = s;
+    gSs.dwWin32ExitCode = win32;
+    gSs.dwControlsAccepted = (s == SERVICE_START_PENDING) ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+    gSs.dwWaitHint = waitHintMs;
+    SetServiceStatus(gSsh, &gSs);
+}
+
+// ----------------- helpers --------------------
+static void KillProcessTree(HANDLE hProcess)
+{
+    if (!hProcess) return;
+    DWORD pid = 0;
+    if (!GetProcessId(hProcess)) return;
+    pid = GetProcessId(hProcess);
+
+    // Try graceful then hard
+    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+    TerminateProcess(hProcess, 0);
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{ sizeof(pe) };
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ParentProcessID == pid) {
+                    HANDLE ch = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if (ch) { TerminateProcess(ch, 0); CloseHandle(ch); }
+                }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+}
+
+// Return a good interactive session id:
+//  - Prefer an ACTIVE RDP session (ClientProtocolType == 2)
+//  - else fall back to active console session
+static DWORD FindInteractiveSessionId()
+{
+    DWORD best = 0xFFFFFFFF;
+
+    PWTS_SESSION_INFO pInfo = nullptr;
+    DWORD count = 0;
+    if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pInfo, &count)) {
+        for (DWORD i = 0; i < count; ++i) {
+            DWORD sid = pInfo[i].SessionId;
+
+            // state
+            DWORD bytes = 0;
+            WTS_CONNECTSTATE_CLASS* pState = nullptr;
+            if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sid, WTSConnectState, (LPWSTR*)&pState, &bytes) || !pState) {
+                if (pState) WTSFreeMemory(pState);
+                continue;
+            }
+            WTS_CONNECTSTATE_CLASS st = *pState;
+            WTSFreeMemory(pState);
+
+            // client protocol
+            LPWSTR pProto = nullptr;
+            int proto = 0;
+            if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sid, WTSClientProtocolType, (LPWSTR*)&pProto, &bytes) && pProto) {
+                proto = *(USHORT*)pProto;
+                WTSFreeMemory(pProto);
+            }
+
+            if (st == WTSActive && proto == 2 /*RDP*/) {
+                best = sid;
+                break;
+            }
+        }
+        WTSFreeMemory(pInfo);
+    }
+
+    if (best != 0xFFFFFFFF) {
+        LogF(L"Found ACTIVE RDP session: %u", best);
+        return best;
+    }
+
+    DWORD cs = WTSGetActiveConsoleSessionId();
+    if (cs != 0xFFFFFFFF) {
+        LogF(L"Falling back to console session: %u", cs);
+        return cs;
+    }
+
+    LogF(L"No interactive session found.");
+    return 0xFFFFFFFF;
+}
+
+// Launch Rust CH in a specific interactive session using the user's token
+static HANDLE LaunchRustCHInSession(DWORD sessionId)
+{
+    const wchar_t* exePath = L"C:\\PAM\\qcm_autologin_service.exe";
+    const wchar_t* args    = L" --port 10443 --log-dir C:\\PAM\\logs";
+
+    HANDLE userToken = nullptr;
+    if (!WTSQueryUserToken(sessionId, &userToken)) {
+        LogF(L"WTSQueryUserToken failed ec=%lu (sid=%u)", GetLastError(), sessionId);
+        return nullptr;
+    }
+
+    HANDLE primary = nullptr;
+    if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, nullptr,
+        SecurityIdentification, TokenPrimary, &primary)) {
+        LogF(L"DuplicateTokenEx failed ec=%lu", GetLastError());
+        CloseHandle(userToken);
+        return nullptr;
+    }
+    CloseHandle(userToken);
+
+    wchar_t cmd[1024];
+    StringCchPrintfW(cmd, 1024, L"\"%s\"%s", exePath, args);
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+    PROCESS_INFORMATION pi{};
+
+    LPVOID env = nullptr;
+    CreateEnvironmentBlock(&env, primary, FALSE);
+
+    BOOL ok = CreateProcessAsUserW(
+        primary, exePath, cmd,
+        nullptr, nullptr, FALSE,
+        CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+        env, L"C:\\PAM", &si, &pi
+    );
+
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(primary);
+
+    if (!ok) {
+        LogF(L"CreateProcessAsUserW failed ec=%lu (sid=%u)", GetLastError(), sessionId);
+        return nullptr;
+    }
+
+    LogF(L"Launched Rust CH in session %u, PID=%lu", sessionId, (unsigned long)pi.dwProcessId);
+    CloseHandle(pi.hThread);
+    return pi.hProcess; // caller closes
+}
+
+// Worker: keep a Rust child running in the *current* interactive session
+static DWORD WINAPI Worker(LPVOID)
+{
+    CreateDirectoryW(L"C:\\PAM", nullptr);
+    CreateDirectoryW(L"C:\\PAM\\logs", nullptr);
+
+    DWORD currentSession = 0xFFFFFFFF;
+
+    for (;;) {
+        if (WaitForSingleObject(gStopEvent, 500) == WAIT_OBJECT_0) break;
+
+        // detect active session each loop (handles user logoff/logon)
+        DWORD desired = FindInteractiveSessionId();
+
+        // (Re)launch if needed
+        if (desired != 0xFFFFFFFF && (gChildProc == nullptr || desired != currentSession)) {
+            if (gChildProc) { KillProcessTree(gChildProc); CloseHandle(gChildProc); gChildProc = nullptr; }
+            currentSession = desired;
+            gChildProc = LaunchRustCHInSession(currentSession);
+        }
+
+        // if child died, clear it to relaunch next loop
+        if (gChildProc) {
+            DWORD code = STILL_ACTIVE;
+            if (GetExitCodeProcess(gChildProc, &code) && code != STILL_ACTIVE) {
+                LogF(L"Rust CH exited (%lu); will restart.", code);
+                CloseHandle(gChildProc); gChildProc = nullptr;
+            }
+        }
+    }
+
+    if (gChildProc) { KillProcessTree(gChildProc); CloseHandle(gChildProc); gChildProc = nullptr; }
+    LogF(L"Service worker exit");
+    return 0;
+}
+
+// -------------- SCM plumbing --------------
+static void WINAPI CtrlHandler(DWORD ctrl)
+{
+    if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
+        LogF(L"Service stop requested");
+        SetState(SERVICE_STOP_PENDING, NO_ERROR, 4000);
+        if (gStopEvent) SetEvent(gStopEvent);
+    }
+}
+
+static void WINAPI SvcMain(DWORD, LPWSTR*)
+{
+    gSsh = RegisterServiceCtrlHandlerW(kSvcName, CtrlHandler);
+    if (!gSsh) return;
+
+    SetState(SERVICE_START_PENDING, NO_ERROR, 4000);
+
+    gStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+
+    SetState(SERVICE_RUNNING);
+    WaitForSingleObject(th, INFINITE);
+
+    CloseHandle(th);
+    CloseHandle(gStopEvent); gStopEvent = nullptr;
+
+    SetState(SERVICE_STOPPED);
+}
+
+// Use GUI subsystem so no console window appears when started by SCM
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
+{
+    SERVICE_TABLE_ENTRYW ste[] = {
+        { (LPWSTR)kSvcName, SvcMain },
+        { nullptr, nullptr }
+    };
+    StartServiceCtrlDispatcherW(ste);
+    return 0;
+}
