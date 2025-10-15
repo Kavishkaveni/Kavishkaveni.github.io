@@ -323,6 +323,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		SendMessage(hSearchBox, EM_SETCUEBANNER, 0, (LPARAM)L"Search by task number...");
 		SendMessage(hSearchDevices, EM_SETCUEBANNER, 0, (LPARAM)L"Search devices...");
 
+
+
 		// --- Text limits ---
 		SendMessage(hSearchBox, EM_LIMITTEXT, 100, 0);
 		SendMessage(hSearchDevices, EM_LIMITTEXT, 100, 0);
@@ -403,6 +405,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	}
 	case WM_COMMAND:
 	{
+		if (HIWORD(wParam) == EN_SETFOCUS) {
+			HWND hEdit = (HWND)lParam;
+			SetWindowText(hEdit, L"");
+		}
 		//  Detect typing in the left search bar
 		if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == hSearchDevices)
 		{
