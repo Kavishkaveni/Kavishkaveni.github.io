@@ -750,16 +750,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		FillRect(hdc, &rcHeader, header);
 		DeleteObject(header);
 
-		// --- Rounded background behind TOP search ---
-		{
-			RECT r = { 420, 25, 420 + 260, 25 + 25 };
-			FillRoundedRect(hdc, r, RGB(255, 255, 255), 8);
-			HPEN p = CreatePen(PS_SOLID, 1, RGB(210, 210, 210));
-			HGDIOBJ old = SelectObject(hdc, p);
-			RoundRect(hdc, r.left, r.top, r.right, r.bottom, 8, 8);
-			SelectObject(hdc, old);
-			DeleteObject(p);
-		}
+		// --- Rounded background behind TOP search (with subtle shadow) ---
+{
+    RECT r = { 420, 25, 420 + 260, 25 + 25 };
+
+    // soft shadow background
+    RECT shadow = r;
+    OffsetRect(&shadow, 2, 2);
+    FillRoundedRect(hdc, shadow, RGB(220, 220, 220), 8); // light gray shadow
+
+    // main white box
+    FillRoundedRect(hdc, r, RGB(255, 255, 255), 8);
+
+    // border to separate from background
+    HPEN p = CreatePen(PS_SOLID, 1, RGB(180, 180, 180)); // slightly darker border
+    HGDIOBJ old = SelectObject(hdc, p);
+    RoundRect(hdc, r.left, r.top, r.right, r.bottom, 8, 8);
+    SelectObject(hdc, old);
+    DeleteObject(p);
+}
 
 		// --- Rounded background behind LEFT search (Devices/Username) ---
 		{
