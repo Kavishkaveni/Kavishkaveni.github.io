@@ -563,22 +563,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			wchar_t input[100];
 			GetWindowText(hSearchBox, input, 100);
 			std::wstring query(input);
-
-			std::transform(query.begin(), query.end(), query.begin(), ::towupper); //  Uppercase fix
+			std::transform(query.begin(), query.end(), query.begin(), ::towupper); // make uppercase
 
 			g_filteredDevices.clear();
 
+			bool isTaskMode = isTask;      // true if Task button clicked
+			bool isChangeMode = !isTask;   // true if Changer button clicked
+
 			for (const auto& d : g_devices)
 			{
-				std::string taskStr(query.begin(), query.end());
+				std::string queryStr(query.begin(), query.end());
+
+				// Skip invalid prefix depending on current mode
+				if (isTaskMode && queryStr.rfind("CHG", 0) == 0)
+					continue;
+				if (isChangeMode && queryStr.rfind("TSK", 0) == 0)
+					continue;
+
 				std::string body = "{";
 
-				if (taskStr.rfind("TSK", 0) == 0)
-					body += "\"task_number\":\"" + taskStr + "\",";
-				else if (taskStr.rfind("CHG", 0) == 0)
-					body += "\"change_number\":\"" + taskStr + "\",";
-				else
-					body += "\"task_number\":\"TSK" + taskStr + "\","; // short numbers allowed
+				if (isTaskMode) {
+					// Task mode → only TSKxxx or short numbers
+					if (queryStr.rfind("TSK", 0) == 0)
+						body += "\"task_number\":\"" + queryStr + "\",";
+					else
+						body += "\"task_number\":\"TSK" + queryStr + "\","; // allow short numbers
+				}
+				else if (isChangeMode) {
+					// Change mode → only CHGxxx or short numbers
+					if (queryStr.rfind("CHG", 0) == 0)
+						body += "\"change_number\":\"" + queryStr + "\",";
+					else
+						body += "\"change_number\":\"CHG" + queryStr + "\","; // allow short numbers
+				}
 
 				body += "\"device_id\":" + std::to_string(d.id) + "}";
 
