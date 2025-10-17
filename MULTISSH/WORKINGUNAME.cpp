@@ -558,49 +558,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		break;
 
 		// ---------- Top search button ----------
-		case 3: // Search button clicked (task/change)
+		case 3:
 		{
 			wchar_t input[100];
 			GetWindowText(hSearchBox, input, 100);
 			std::wstring query(input);
-			std::transform(query.begin(), query.end(), query.begin(), ::towlower);
+
+			std::transform(query.begin(), query.end(), query.begin(), ::towupper); //  Uppercase fix
+
 			g_filteredDevices.clear();
-
-			//  mapping TSK/CHG numbers
-			std::map<std::wstring, std::vector<int>> ticketMap = {
-				{L"tsk123", {43, 41, 15, 16}},
-				{L"chg123", {43, 41, 15, 16}},
-				{L"tsk124", {45, 14, 13, 11}},
-				{L"chg124", {45, 14, 13, 11}},
-				{L"tsk125", {10, 9, 8, 7}},
-				{L"chg125", {10, 9, 8, 7}},
-				{L"tsk126", {6, 4, 1, 42}},
-				{L"chg126", {6, 4, 1, 42}}
-			};
-
-			std::wstring lowerQuery = query;
-			std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), ::towlower);
-
-			// --- Support numeric-only input for task search ---
-			bool isNumeric = !lowerQuery.empty() &&
-				std::all_of(lowerQuery.begin(), lowerQuery.end(), ::iswdigit);
-
-			if (isNumeric && isTask) {
-				lowerQuery = L"tsk" + lowerQuery;  // prepend "tsk" automatically
-			}
 
 			for (const auto& d : g_devices)
 			{
-				for (const auto& kv : ticketMap)
+				std::string taskStr(query.begin(), query.end());
+				std::string body = "{";
+
+				if (taskStr.rfind("TSK", 0) == 0)
+					body += "\"task_number\":\"" + taskStr + "\",";
+				else if (taskStr.rfind("CHG", 0) == 0)
+					body += "\"change_number\":\"" + taskStr + "\",";
+				else
+					body += "\"task_number\":\"TSK" + taskStr + "\","; // short numbers allowed
+
+				body += "\"device_id\":" + std::to_string(d.id) + "}";
+
+				DWORD status = 0;
+				std::string response;
+
+				bool ok = http_post_json(L"192.168.8.199", 9000, L"/api/validate_ticket", body, &status, response);
+
+				if (ok && status == 200 && response.find("\"allowed\":true") != std::string::npos)
 				{
-					if (lowerQuery == kv.first)
-					{
-						// show only matching devices
-						if (std::find(kv.second.begin(), kv.second.end(), d.id) != kv.second.end())
-						{
-							g_filteredDevices.push_back(d);
-						}
-					}
+					g_filteredDevices.push_back(d);
+				}
+				else
+				{
+					std::wstring err = L"[DEBUG] Skipped device " + std::to_wstring(d.id) +
+						L" (status=" + std::to_wstring(status) + L")";
+					logEvent(err);
 				}
 			}
 
