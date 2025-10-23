@@ -191,13 +191,25 @@ export default function Dashboard() {
     active_sessions: 0,
     total_devices: 0,
     recent_sessions: [],
+    session_activity: [],
+    top_users: [],
   });
+  const [loading, setLoading] = useState(true);
 
+  // ✅ Fetch data using built-in fetch()
   useEffect(() => {
-    fetch("http://localhost:9000/api/dashboard")
-      .then((res) => res.json())
-      .then((data) => setDashboard(data))
-      .catch((err) => console.error("Dashboard fetch error:", err));
+    const fetchData = async () => {
+      try {
+        const res = await fetch("http://localhost:9000/api/dashboard");
+        const data = await res.json();
+        setDashboard(data);
+      } catch (error) {
+        console.error("Error fetching dashboard:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchData();
   }, []);
 
   const getStatusBadge = (status) => {
@@ -206,8 +218,6 @@ export default function Dashboard() {
         return <span className="badge bg-success">Active</span>;
       case "Ended":
         return <span className="badge bg-danger">Ended</span>;
-      case "Failed":
-        return <span className="badge bg-warning text-dark">Failed</span>;
       default:
         return <span className="badge bg-secondary">{status}</span>;
     }
@@ -222,142 +232,160 @@ export default function Dashboard() {
       case "HTTPS":
         return <span className="badge bg-info text-dark">HTTPS</span>;
       case "MULTISSH":
-        return <span className="badge bg-success">MULTISSH</span>;
+        return <span className="badge bg-dark">MULTISSH</span>;
       default:
         return <span className="badge bg-light text-dark">{type}</span>;
     }
   };
 
+  if (loading) {
+    return (
+      <div className="text-center mt-5">
+        <div className="spinner-border text-primary" role="status"></div>
+        <p className="mt-3 text-muted">Loading Dashboard...</p>
+      </div>
+    );
+  }
+
   return (
-  <div className="container-fluid">
-    <h4 className="mb-4">Dashboard Overview</h4>
+    <div className="container-fluid">
+      <h4 className="mb-4">Dashboard Overview</h4>
 
-    {/* Metrics */}
-    <div className="row g-3 mb-4">
-      <div className="col-md-4">
-        <div className="card border-start border-4 border-success h-100">
-          <div className="card-body">
-            <h6 className="text-muted">Active Sessions</h6>
-            <h3 className="fw-bold">{dashboard.active_sessions}</h3>
-            <small className="text-success">Live count from backend</small>
-          </div>
-        </div>
-      </div>
-      <div className="col-md-4">
-        <div className="card border-start border-4 border-primary h-100">
-          <div className="card-body">
-            <h6 className="text-muted">Total Devices</h6>
-            <h3 className="fw-bold">{dashboard.total_devices}</h3>
-            <small className="text-muted">Fetched from backend</small>
-          </div>
-        </div>
-      </div>
-      <div className="col-md-4">
-        <div className="card border-start border-4 border-danger h-100">
-          <div className="card-body">
-            <h6 className="text-muted">Security Alerts</h6>
-            <h3 className="fw-bold">0</h3>
-            <small className="text-danger">⚠ Coming soon</small>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    {/* Session Activity + Top Users */}
-    <div className="row g-4">
-      {/* Graph (Session Activity Last 7 Days) */}
-      <div className="col-lg-8">
-        <div className="card h-100">
-          <div className="card-body">
-            <div className="d-flex justify-content-between align-items-center mb-3">
-              <h5 className="card-title mb-0">Session Activity (Last 7 Days)</h5>
+      {/* Metrics Row */}
+      <div className="row g-3 mb-4">
+        <div className="col-md-4">
+          <div className="card border-start border-4 border-success h-100">
+            <div className="card-body">
+              <h6 className="text-muted">Active Sessions</h6>
+              <h3 className="fw-bold">{dashboard.active_sessions}</h3>
+              <small className="text-success">Live count from backend</small>
             </div>
-            {/* TEMPORARY GRAPH PLACEHOLDER */}
-            <div style={{ height: "200px" }} className="d-flex align-items-end overflow-auto">
-              {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((day, i) => (
-                <div key={i} className="flex-fill text-center me-2" style={{ minWidth: "60px" }}>
-                  <div
-                    className="bg-primary rounded-top"
-                    style={{
-                      height: `${Math.random() * 100}%`,
-                      minHeight: "20px",
-                      marginBottom: "10px",
-                    }}
-                  ></div>
-                  <small className="text-muted">{day}</small>
-                </div>
-              ))}
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="card border-start border-4 border-primary h-100">
+            <div className="card-body">
+              <h6 className="text-muted">Total Devices</h6>
+              <h3 className="fw-bold">{dashboard.total_devices}</h3>
+              <small className="text-muted">Fetched from backend</small>
             </div>
-            <div className="text-center mt-2">
-              <small className="text-muted">Will show 7-day trend soon</small>
+          </div>
+        </div>
+        <div className="col-md-4">
+          <div className="card border-start border-4 border-danger h-100">
+            <div className="card-body">
+              <h6 className="text-muted">Security Alerts</h6>
+              <h3 className="fw-bold">0</h3>
+              <small className="text-danger">⚠ Coming soon</small>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Top Users */}
-      <div className="col-lg-4">
-        <div className="card h-100">
-          <div className="card-body">
-            <h5 className="card-title">Top Users</h5>
-            <ul className="list-group">
-              {[
-                { name: "testuser", sessions: 120 },
-                { name: "devuser", sessions: 95 },
-                { name: "admin", sessions: 80 },
-              ].map((user, i) => (
-                <li
-                  key={i}
-                  className="list-group-item d-flex justify-content-between align-items-center"
-                >
-                  {user.name}
-                  <span className="badge bg-secondary rounded-pill">{user.sessions}</span>
-                </li>
-              ))}
-            </ul>
+      {/* Session Activity + Top Users */}
+      <div className="row g-4">
+        {/* Session Activity Graph */}
+        <div className="col-lg-8">
+          <div className="card h-100">
+            <div className="card-body">
+              <h5 className="card-title mb-3">Session Activity (Last 7 Days)</h5>
+              <div
+                className="d-flex align-items-end overflow-auto"
+                style={{ height: "200px" }}
+              >
+                {dashboard.session_activity.length > 0 ? (
+                  dashboard.session_activity.map((item, i) => (
+                    <div
+                      key={i}
+                      className="flex-fill text-center me-2"
+                      style={{ minWidth: "60px" }}
+                    >
+                      <div
+                        className="bg-primary rounded-top"
+                        style={{
+                          height: `${(item.count / 35) * 100}%`,
+                          minHeight: "20px",
+                          marginBottom: "10px",
+                        }}
+                      ></div>
+                      <small className="text-muted">{item.day}</small>
+                      <br />
+                      <small className="fw-bold">{item.count}</small>
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-muted">No session activity data</p>
+                )}
+              </div>
+            </div>
           </div>
         </div>
-      </div>
-    </div>
 
-    {/* Recent Sessions Table */}
-    <div className="card mt-4">
-      <div className="card-body">
-        <h5 className="card-title">Recent Sessions (Live)</h5>
-        <div className="table-responsive">
-          <table className="table table-bordered table-sm align-middle">
-            <thead className="table-light">
-              <tr>
-                <th>User</th>
-                <th>Device</th>
-                <th>Protocol</th>
-                <th>Status</th>
-                <th>Start Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {dashboard.recent_sessions.length > 0 ? (
-                dashboard.recent_sessions.map((s, i) => (
-                  <tr key={i}>
-                    <td>{s.user}</td>
-                    <td>{s.device}</td>
-                    <td>{getTypeBadge(s.protocol)}</td>
-                    <td>{getStatusBadge(s.status)}</td>
-                    <td>{new Date(s.start_time).toLocaleString()}</td>
-                  </tr>
-                ))
+        {/* Top Users */}
+        <div className="col-lg-4">
+          <div className="card h-100">
+            <div className="card-body">
+              <h5 className="card-title">Top Users</h5>
+              {dashboard.top_users.length > 0 ? (
+                <ul className="list-group">
+                  {dashboard.top_users.map((user, i) => (
+                    <li
+                      key={i}
+                      className="list-group-item d-flex justify-content-between align-items-center"
+                    >
+                      {user.name}
+                      <span className="badge bg-secondary rounded-pill">
+                        {user.sessions}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
               ) : (
-                <tr>
-                  <td colSpan="5" className="text-center text-muted">
-                    No recent sessions found
-                  </td>
-                </tr>
+                <p className="text-muted">No top user data</p>
               )}
-            </tbody>
-          </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Recent Sessions */}
+      <div className="card mt-4">
+        <div className="card-body">
+          <h5 className="card-title">Recent Sessions (Live)</h5>
+          <div className="table-responsive">
+            <table className="table table-bordered table-sm align-middle">
+              <thead className="table-light">
+                <tr>
+                  <th>User</th>
+                  <th>Device</th>
+                  <th>Protocol</th>
+                  <th>Status</th>
+                  <th>Start Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dashboard.recent_sessions.length > 0 ? (
+                  dashboard.recent_sessions.map((s, i) => (
+                    <tr key={i}>
+                      <td>{s.user}</td>
+                      <td>{s.device}</td>
+                      <td>{getTypeBadge(s.protocol)}</td>
+                      <td>{getStatusBadge(s.status)}</td>
+                      <td>{new Date(s.start_time).toLocaleString()}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan="5" className="text-center text-muted">
+                      No recent sessions found
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
-  </div>
-);
+  );
 }
