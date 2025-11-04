@@ -32,15 +32,13 @@ impl CertificateService {
     }
 
     // ------------------------------------------------------------------
-    // CREATE CSR
+    // CREATE CSR  (stores CSR + private key; validity_days from UI)
     // ------------------------------------------------------------------
     pub async fn create_csr(&self, req: CreateCSRRequest) -> Result<CSRResponse> {
-        // generate key
         let rsa = Rsa::generate(2048)?;
         let private_key_pem = rsa.private_key_to_pem()?;
         let pkey = PKey::from_rsa(rsa)?;
 
-        // subject from request (all come from UI here)
         let mut name_builder = X509NameBuilder::new()?;
         name_builder.append_entry_by_text("CN", &req.common_name)?;
         name_builder.append_entry_by_text("O", &req.organization)?;
@@ -48,7 +46,6 @@ impl CertificateService {
         name_builder.append_entry_by_text("C", &req.country)?;
         let name = name_builder.build();
 
-        // build CSR
         let mut csr_builder = X509Req::builder()?;
         csr_builder.set_subject_name(&name)?;
         csr_builder.set_pubkey(&pkey)?;
@@ -57,7 +54,6 @@ impl CertificateService {
         let csr_pem = csr_builder.build().to_pem()?;
         let csr_text = String::from_utf8(csr_pem)?;
 
-        // persist
         let csr = sqlx::query_as::<_, CertificateSigningRequest>(
             r#"
             INSERT INTO certificate_requests
@@ -121,7 +117,6 @@ impl CertificateService {
 
     // ------------------------------------------------------------------
     // CREATE SELF-SIGNED CERTIFICATE (from internal CSR row)
-    // -> validity_days is taken from that CSR row (no hard-code)
     // ------------------------------------------------------------------
     pub async fn create_self_signed_certificate(
         &self,
@@ -174,23 +169,27 @@ impl CertificateService {
         let cert_pem = cert.to_pem()?;
         let cert_pem_str = String::from_utf8(cert_pem)?;
 
+        //   Extract and store public key
+        let public_key_pem = cert.public_key()?.public_key_to_pem()?;
+        let public_key_str = String::from_utf8(public_key_pem)?;
+
         let issued_date = Utc::now();
         let expiry_date = issued_date + Duration::days(validity_days as i64);
 
         sqlx::query!(
             r#"
             INSERT INTO certificates
-                (certificate_name, csr_id, serial_number, issuer, issued_date, expiry_date, cert_pem, status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,'active')
-            "#
-            ,
+                (certificate_name, csr_id, serial_number, issuer, issued_date, expiry_date, cert_pem, public_key, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active')
+            "#,
             certificate_name,
             csr_id,
             serial_number.to_bn()?.to_dec_str()?.to_string(),
             "Self-Signed",
             issued_date,
             expiry_date,
-            cert_pem_str
+            cert_pem_str,
+            public_key_str
         )
         .execute(&self.pool)
         .await?;
@@ -199,13 +198,7 @@ impl CertificateService {
     }
 
     // ------------------------------------------------------------------
-    // CREATE SELF-SIGNED FROM UPLOADED CSR (no hard-coded subject data)
-    // Rules:
-    // - Subject (CN/O/OU/C) parsed from CSR.
-    // - validity_days picked in this order:
-    //     1) match an existing CSR row with same subject -> use its validity_days
-    //     2) env CERT_DEFAULT_VALIDITY_DAYS -> parse i64
-    //     3) fallback 365
+    // CREATE SELF-SIGNED FROM UPLOADED CSR
     // ------------------------------------------------------------------
     pub async fn create_self_signed_from_file(
         &self,
@@ -213,38 +206,29 @@ impl CertificateService {
         certificate_name: String,
     ) -> Result<(), anyhow::Error> {
         let csr = X509Req::from_pem(csr_pem.as_bytes())?;
-        let (cn, o, ou, c) = extract_subject(&csr)?;
+        let (_cn, _o, _ou, _c) = extract_subject(&csr)?;
 
-        // Try to reuse validity_days from an existing CSR row with same subject
-        let validity_days: i64 = {
-            // attempt DB lookup
-            if let Ok(row) = sqlx::query!(
-                r#"
-                SELECT validity_days
-                FROM certificate_requests
-                WHERE common_name = $1 AND organization = $2 AND org_unit = $3 AND country = $4
-                ORDER BY created_at DESC
-                LIMIT 1
-                "#,
-                cn,
-                o,
-                ou,
-                c
-            )
-            .fetch_optional(&self.pool)
-            .await
-            {
-                if let Some(r) = row {
-                    if let Some(v) = r.validity_days { v as i64 } else { pick_default_validity() }
-                } else {
-                    pick_default_validity()
-                }
-            } else {
-                pick_default_validity()
+        let validity_days: i64 = if let Ok(row) = sqlx::query!(
+            r#"
+            SELECT validity_days
+            FROM certificate_requests
+            WHERE common_name = $1 AND organization = $2 AND org_unit = $3 AND country = $4
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            _cn, _o, _ou, _c
+        )
+        .fetch_optional(&self.pool)
+        .await
+        {
+            match row.and_then(|r| r.validity_days) {
+                Some(v) if v > 0 => v as i64,
+                _ => pick_default_validity(),
             }
+        } else {
+            pick_default_validity()
         };
 
-        // sign with a fresh key (self-signed)
         let rsa = Rsa::generate(2048)?;
         let pkey = PKey::from_rsa(rsa)?;
 
@@ -265,8 +249,13 @@ impl CertificateService {
         builder.set_not_after(&not_after)?;
         builder.sign(&pkey, MessageDigest::sha256())?;
 
-        let cert_pem = builder.build().to_pem()?;
+        let cert = builder.build();
+        let cert_pem = cert.to_pem()?;
         let cert_pem_str = String::from_utf8(cert_pem)?;
+
+        //  Extract and store public key
+        let public_key_pem = cert.public_key()?.public_key_to_pem()?;
+        let public_key_str = String::from_utf8(public_key_pem)?;
 
         let issued = Utc::now();
         let expiry = issued + Duration::days(validity_days);
@@ -274,15 +263,16 @@ impl CertificateService {
         sqlx::query!(
             r#"
             INSERT INTO certificates
-                (certificate_name, csr_id, serial_number, issuer, issued_date, expiry_date, cert_pem, status)
-            VALUES ($1, NULL, $2, $3, $4, $5, $6, 'active')
+                (certificate_name, csr_id, serial_number, issuer, issued_date, expiry_date, cert_pem, public_key, status)
+            VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, 'active')
             "#,
             certificate_name,
             serial_number.to_bn()?.to_dec_str()?.to_string(),
             "Uploaded CSR",
             issued,
             expiry,
-            cert_pem_str
+            cert_pem_str,
+            public_key_str
         )
         .execute(&self.pool)
         .await?;
@@ -291,24 +281,16 @@ impl CertificateService {
     }
 
     // ------------------------------------------------------------------
-    // SAVE UPLOADED CSR ONLY (no hard-coded subject)
-    // Subject fields taken from CSR; validity_days left NULL (unknown).
+    // SAVE UPLOADED CSR ONLY
     // ------------------------------------------------------------------
     pub async fn save_uploaded_csr(
         &self,
         csr_name_fallback: String,
         csr_text: String,
     ) -> Result<(), anyhow::Error> {
-        // parse CSR to extract subject; if some field missing, keep fallback minimal
         let csr = X509Req::from_pem(csr_text.as_bytes())?;
-        let (mut cn, mut o, mut ou, mut c) = extract_subject(&csr)?;
-
-        if cn.is_empty() {
-            cn = csr_name_fallback; // last-resort fallback name
-        }
-
-        // validity_days unknown at "upload csr" time -> store NULL
-        let validity_days: Option<i32> = None;
+        let (mut cn, o, ou, c) = extract_subject(&csr)?;
+        if cn.is_empty() { cn = csr_name_fallback; }
 
         sqlx::query!(
             r#"
@@ -320,7 +302,7 @@ impl CertificateService {
             nullable(&o),
             nullable(&ou),
             nullable(&c),
-            validity_days,
+            Option::<i32>::None,
             csr_text,
             Utc::now()
         )
@@ -341,16 +323,16 @@ fn extract_subject(csr: &X509Req) -> Result<(String, String, String, String), an
     let mut c  = String::new();
 
     for entry in subject.entries() {
-    let val = entry.data().as_utf8()?.to_string();
-    let key = entry.object().nid().short_name().unwrap_or("");
-    match key {
-        "CN" => cn = val,
-        "O"  => o  = val,
-        "OU" => ou = val,
-        "C"  => c  = val,
-        _ => {}
+        let val = entry.data().as_utf8()?.to_string();
+        let key = entry.object().nid().short_name().unwrap_or("");
+        match key {
+            "CN" => cn = val,
+            "O"  => o  = val,
+            "OU" => ou = val,
+            "C"  => c  = val,
+            _ => {}
+        }
     }
-}
     Ok((cn, o, ou, c))
 }
 
