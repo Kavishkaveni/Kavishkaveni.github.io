@@ -2,12 +2,14 @@
 import { useEffect, useState } from "react";
 import Modal from "../components/Modal"; //  externalized modal
 import ApiService from "../services/api";
+import { createJumpHostCredential } from "../services/jumpHostApi";
 
 export default function PasswordVault() {
   const [vaultGroups, setVaultGroups] = useState([]);
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [vaultEntries, setVaultEntries] = useState([]);
   const [devices, setDevices] = useState([]);
+  const [jumpHostDevices, setJumpHostDevices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [showAddVaultModal, setShowAddVaultModal] = useState(false);
@@ -19,11 +21,13 @@ export default function PasswordVault() {
     password: "",
   });
 
-  // Load vault groups initially
   useEffect(() => {
     loadVaultGroups();
     loadDevices();
+    loadJumpHosts();   
   }, []);
+
+
 
   const loadVaultGroups = async () => {
     try {
@@ -35,19 +39,28 @@ export default function PasswordVault() {
   };
 
   const loadVaultEntries = async (groupId) => {
-    try {
-      setLoading(true);
-      setError(null);
-      const response = await ApiService.getVaultEntries(groupId);
-      setVaultEntries(response);
-    } catch (err) {
-      setError("Failed to load vault entries. Please check backend.");
-      console.error("Error loading vault entries:", err);
-      setVaultEntries([]);
-    } finally {
-      setLoading(false);
+  try {
+    setLoading(true);
+    setError(null);
+
+    let response;
+
+    // if this vault = JumpHost → load from jump host vault table
+    if (selectedGroup?.name === "JumpHost") {
+      response = await ApiService.request("/jump-host-vault");
+    } else {
+      response = await ApiService.getVaultEntriesByGroup(groupId);
     }
-  };
+
+    setVaultEntries(response);
+  } catch (err) {
+    setError("Failed to load vault entries. Please check backend.");
+    console.error("Error loading vault entries:", err);
+    setVaultEntries([]);
+  } finally {
+    setLoading(false);
+  }
+};
 
   const loadDevices = async () => {
     try {
@@ -57,6 +70,15 @@ export default function PasswordVault() {
       console.error("Error loading devices:", err);
     }
   };
+
+  const loadJumpHosts = async () => {
+  try {
+    const data = await ApiService.request("/jump-hosts");
+    setJumpHostDevices(data);
+  } catch(e) {
+    console.error("jump hosts load failed", e);
+  }
+};
 
   // Create new Vault Group
   const handleCreateVaultGroup = async (e) => {
@@ -75,12 +97,22 @@ export default function PasswordVault() {
   const submitAddEntry = async (e) => {
     e.preventDefault();
     try {
-      await ApiService.createVaultEntry({
-        device_id: parseInt(formData.device_id),
-        username: formData.username,
-        password: formData.password,
-        group_id: selectedGroup.id,
-      });
+      // if this group is JumpHost → call jump host API
+if (selectedGroup.name === "JumpHost") {
+  await createJumpHostCredential({
+    jump_host_id: parseInt(formData.device_id),
+    username: formData.username,
+    password: formData.password,
+  });
+} else {
+  // normal vault
+  await ApiService.createVaultEntry({
+    device_id: parseInt(formData.device_id),
+    username: formData.username,
+    password: formData.password,
+    group_id: selectedGroup.id,
+  });
+}
       await loadVaultEntries(selectedGroup.id);
       setShowAddEntryModal(false);
       setFormData({ device_id: "", username: "", password: "" });
@@ -117,9 +149,20 @@ const handleDeleteEntry = async (entry) => {
         </h4>
         <button
           className="btn btn-primary"
-          onClick={() =>
-            selectedGroup ? setShowAddEntryModal(true) : setShowAddVaultModal(true)
-          }
+          onClick={() => {
+  if (!selectedGroup) {
+    setShowAddVaultModal(true);
+    return;
+  }
+
+  if (!selectedGroup.certificate_id) {
+    alert("⚠ Please complete certificate linking first.");
+    window.location.href = "/certificates"; // change if route name diff
+    return;
+  }
+
+  setShowAddEntryModal(true);
+}}
         >
           {selectedGroup ? "+ Add Credential" : "+ Add Sub Vault"}
         </button>
@@ -183,8 +226,8 @@ const handleDeleteEntry = async (entry) => {
 <tbody>
   {vaultEntries.map((entry) => (
     <tr key={entry.id}>
-      <td>{entry.device_name}</td>
-      <td>{entry.device_ip}</td>
+      <td>{ selectedGroup?.name === "JumpHost" ? entry.jh_name : entry.device_name }</td>
+<td>{ selectedGroup?.name === "JumpHost" ? entry.jh_ip   : entry.device_ip   }</td>
       <td>{entry.username}</td>
       <td>{new Date(entry.created_at).toLocaleDateString()}</td>
       <td>{new Date(entry.updated_at).toLocaleDateString()}</td>
@@ -270,7 +313,7 @@ const handleDeleteEntry = async (entry) => {
                 required
               >
                 <option value="">Select Device</option>
-                {devices.map((device) => (
+                {(selectedGroup?.name === "JumpHost" ? jumpHostDevices : devices).map((device) => (
                   <option key={device.id} value={device.id}>
                     {device.name} ({device.ip})
                   </option>
