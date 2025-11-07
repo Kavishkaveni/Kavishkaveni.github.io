@@ -1,0 +1,875 @@
+// qcmrec_dxgi.cpp
+// DXGI Desktop recorder with manual mode and Windows Service mode
+
+#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+#define WINVER 0x0601
+#define _WIN32_WINNT 0x0601
+#define NTDDI_VERSION NTDDI_WIN7
+// ---- encryption includes ----
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <winsvc.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <dxgi1_6.h>
+#include <wincodec.h>
+#include <strsafe.h>
+#include <conio.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <wrl/client.h>
+#include <fstream>
+#include <sstream>
+#include <locale>
+#include <codecvt>
+#include <Wtsapi32.h>
+#include <UserEnv.h>
+#include <winhttp.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+// ++ OpenSSL/WinCrypto extras for RSA/AES + base64
+#include <openssl/rsa.h>
+#include <openssl/bio.h>
+#include <openssl/rand.h>
+#include <openssl/aes.h>
+#include <wincrypt.h>  // for CryptBinaryToStringA (base64)
+#pragma comment(lib, "Crypt32.lib")
+#include <iomanip>
+
+
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "Wtsapi32.lib")
+#pragma comment(lib, "Userenv.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "windowscodecs.lib")
+
+// Globals
+std::wstring g_uuid;
+std::wstring g_session;
+std::atomic<bool> g_running{ true };   // global running flag
+static std::vector<BYTE> g_rec_aes;
+static std::string g_rec_pub_pem;
+
+// ----------------- Helpers -----------------
+static void EnsureRecFolder() { CreateDirectoryW(L"C:\\REC", nullptr); }
+
+// ---------------- Logging --------------------------
+static void LogRec(const wchar_t* fmt, ...)
+{
+	CreateDirectoryW(L"C:\\PAM", nullptr);
+	wchar_t buf[2048];
+	va_list ap; va_start(ap, fmt);
+	StringCchVPrintfW(buf, _countof(buf), fmt, ap);
+	va_end(ap);
+
+	SYSTEMTIME st; GetLocalTime(&st);
+	wchar_t msg[2300];
+	StringCchPrintfW(msg, _countof(msg),
+		L"%04u-%02u-%02u %02u:%02u:%02u [QCMREC] %s\r\n",
+		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, buf);
+
+	HANDLE h = CreateFileW(L"C:\\PAM\\qcmrec.log", FILE_APPEND_DATA, FILE_SHARE_READ,
+		nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h != INVALID_HANDLE_VALUE) {
+		DWORD cb = (DWORD)(lstrlenW(msg) * sizeof(wchar_t));
+		WriteFile(h, msg, cb, &cb, nullptr);
+		CloseHandle(h);
+	}
+}
+
+// --- Forward declare upload function ---
+static void UploadFileToHost(const std::wstring& filePath,
+	const std::wstring& uuid,
+	const std::wstring& session);
+
+// ----------------- Capture Loop -----------------
+static void RunCaptureLoop(std::atomic<bool>& running)
+{
+	EnsureRecFolder();
+
+	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+	if (FAILED(hr)) { LogRec(L"CoInitializeEx failed hr=0x%08X", hr); return; }
+
+	wchar_t videoPath[MAX_PATH] = L"";
+
+	SYSTEMTIME stStart;
+	GetLocalTime(&stStart);
+
+	// --- Wait until the RDP session becomes fully active ---
+	DWORD kTargetSid = wcstoul(g_session.c_str(), nullptr, 10);
+	for (int i = 0; i < 50; ++i) {  // ~5 sec total
+		LPWSTR pState = nullptr;
+		DWORD bytes = 0;
+		if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, kTargetSid,
+			WTSConnectState, &pState, &bytes)) {
+			WTS_CONNECTSTATE_CLASS state = *reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(pState);
+			WTSFreeMemory(pState);
+			if (state == WTSActive) {
+				LogRec(L"Session %u is active, starting capture", kTargetSid);
+				break;
+			}
+		}
+		LogRec(L"Waiting for session %u to become active...", kTargetSid);
+		Sleep(100);
+	}
+	// ---- Notify backend that recording has started ----
+	std::wstring jsonStart = L"{\"uuid\":\"" + g_uuid + L"\"}";
+	std::string bodyStart = std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(jsonStart);
+
+	HINTERNET hSess = WinHttpOpen(L"QCMREC/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (hSess) {
+		HINTERNET hConn = WinHttpConnect(hSess, L"192.168.8.199", 9000, 0);
+		if (hConn) {
+			HINTERNET hReq = WinHttpOpenRequest(hConn, L"POST", L"/api/recordings/start",
+				NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+			if (hReq) {
+				BOOL ok = WinHttpSendRequest(hReq,
+					L"Content-Type: application/json\r\n", -1L,
+					(LPVOID)bodyStart.c_str(), (DWORD)bodyStart.size(),
+					(DWORD)bodyStart.size(), 0);
+				if (ok && WinHttpReceiveResponse(hReq, NULL)) {
+					LogRec(L"[QCMREC] Recording start POST success");
+				}
+				else {
+					LogRec(L"[QCMREC] Recording start POST FAILED ec=%lu", GetLastError());
+				}
+				WinHttpCloseHandle(hReq);
+			}
+			WinHttpCloseHandle(hConn);
+		}
+		WinHttpCloseHandle(hSess);
+	}
+
+
+	Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+	hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+	if (FAILED(hr)) { LogRec(L"CoCreateInstance(WICImagingFactory) failed hr=0x%08X", hr); CoUninitialize(); return; }
+
+	D3D_FEATURE_LEVEL flOut;
+	Microsoft::WRL::ComPtr<ID3D11Device> device;
+	Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+	hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+		D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+		D3D11_SDK_VERSION, &device, &flOut, &context);
+	if (FAILED(hr)) { LogRec(L"D3D11CreateDevice failed hr=0x%08X", hr); CoUninitialize(); return; }
+
+	Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+	device.As(&dxgiDevice);
+	Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+	hr = dxgiDevice->GetAdapter(&adapter);
+	if (FAILED(hr)) { LogRec(L"GetAdapter failed hr=0x%08X", hr); CoUninitialize(); return; }
+
+	Microsoft::WRL::ComPtr<IDXGIOutput> output;
+	hr = adapter->EnumOutputs(0, &output);
+	if (FAILED(hr)) { LogRec(L"EnumOutputs failed hr=0x%08X", hr); CoUninitialize(); return; }
+
+	Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
+	output.As(&output1);
+
+	Microsoft::WRL::ComPtr<IDXGIOutputDuplication> dupl;
+	hr = output1->DuplicateOutput(device.Get(), &dupl);
+	if (FAILED(hr)) {
+		LogRec(L"DuplicateOutput failed hr=0x%08X (DXGI may fail if session is not interactive)", hr);
+		CoUninitialize();
+		return;
+	}
+	else {
+		LogRec(L"DuplicateOutput succeeded");
+	}
+
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+	UINT width = 0, height = 0, pitch = 0;
+	int frameIndex = 0;
+	const int targetFps = 10;
+	const int frameIntervalMs = 1000 / targetFps;
+	Microsoft::WRL::ComPtr<IMFSinkWriter> writer;
+	DWORD streamIndex = 0;
+
+
+	while (running)
+	{
+		LogRec(L"[Loop] running… waiting for next frame");
+
+		DXGI_OUTDUPL_FRAME_INFO fi{};
+		Microsoft::WRL::ComPtr<IDXGIResource> res;
+		hr = dupl->AcquireNextFrame(500, &fi, &res);
+		LogRec(L"[Loop] AcquireNextFrame hr=0x%08X", hr);
+
+		if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+		if (hr == DXGI_ERROR_ACCESS_LOST)
+		{
+			LogRec(L"[Loop] DXGI_ERROR_ACCESS_LOST — finalizing and stopping");
+			if (writer) {
+				writer->Finalize();
+				writer.Reset();
+			}
+			if (dupl) {
+				dupl->ReleaseFrame();
+				dupl.Reset();
+			}
+			break;
+		}
+		if (FAILED(hr)) {
+			LogRec(L"[Loop] FAILED hr=0x%08X — breaking", hr);
+			break;
+		}
+
+		Microsoft::WRL::ComPtr<ID3D11Texture2D> frameTex; res.As(&frameTex);
+
+		if (!staging)
+		{
+			D3D11_TEXTURE2D_DESC desc{}; frameTex->GetDesc(&desc);
+			width = desc.Width; height = desc.Height;
+
+			D3D11_TEXTURE2D_DESC s{}; s.Width = width; s.Height = height; s.MipLevels = 1; s.ArraySize = 1;
+			s.Format = DXGI_FORMAT_B8G8R8A8_UNORM; s.SampleDesc.Count = 1; s.Usage = D3D11_USAGE_STAGING; s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			if (FAILED(device->CreateTexture2D(&s, nullptr, &staging))) {
+				LogRec(L"[Loop] CreateTexture2D staging failed");
+				dupl->ReleaseFrame(); break;
+			}
+
+			pitch = width * 4;
+			MFStartup(MF_VERSION);
+
+			StringCchPrintfW(videoPath, MAX_PATH,
+				L"C:\\REC\\%s_%s_%04u%02u%02u_%02u%02u%02u.mp4",
+				g_uuid.c_str(), g_session.c_str(),
+				stStart.wYear, stStart.wMonth, stStart.wDay,
+				stStart.wHour, stStart.wMinute, stStart.wSecond);
+
+			if (FAILED(MFCreateSinkWriterFromURL(videoPath, nullptr, nullptr, &writer))) {
+				LogRec(L"[Loop] MFCreateSinkWriterFromURL failed");
+				dupl->ReleaseFrame(); break;
+			}
+
+			Microsoft::WRL::ComPtr<IMFMediaType> outType; MFCreateMediaType(&outType);
+			outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+			outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+			outType->SetUINT32(MF_MT_AVG_BITRATE, 8000000);
+			outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+			MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, width, height);
+			MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, targetFps, 1);
+			MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+			writer->AddStream(outType.Get(), &streamIndex);
+
+			Microsoft::WRL::ComPtr<IMFMediaType> inType; MFCreateMediaType(&inType);
+			inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+			inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+			MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, width, height);
+			MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, targetFps, 1);
+			MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+			writer->SetInputMediaType(streamIndex, inType.Get(), nullptr);
+			writer->BeginWriting();
+
+			LogRec(L"[Loop] Writer and staging created %ux%u", width, height);
+		}
+
+		context->CopyResource(staging.Get(), frameTex.Get());
+		D3D11_MAPPED_SUBRESOURCE map{};
+		hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map);
+		if (SUCCEEDED(hr))
+		{
+			Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer; MFCreateMemoryBuffer(map.RowPitch * height, &buffer);
+			BYTE* dst = nullptr; DWORD maxLen = 0;
+			buffer->Lock(&dst, &maxLen, nullptr);
+			BYTE* src = (BYTE*)map.pData;
+			for (UINT y = 0; y < height; ++y) memcpy(dst + y * pitch, src + (height - 1 - y) * map.RowPitch, pitch);
+			buffer->Unlock(); buffer->SetCurrentLength(pitch * height);
+
+			Microsoft::WRL::ComPtr<IMFSample> sample; MFCreateSample(&sample);
+			sample->AddBuffer(buffer.Get());
+			LONGLONG pts = frameIndex * 10000000 / targetFps;
+			sample->SetSampleTime(pts); sample->SetSampleDuration(10000000 / targetFps);
+			writer->WriteSample(streamIndex, sample.Get());
+			context->Unmap(staging.Get(), 0);
+			frameIndex++;
+
+			LogRec(L"[Loop] Frame %d written", frameIndex);
+		}
+		dupl->ReleaseFrame();
+		std::this_thread::sleep_for(std::chrono::milliseconds(frameIntervalMs));
+
+		LogRec(L"[Loop] Checking session state…");
+		LPWSTR pState = nullptr;
+		DWORD bytes = 0;
+		BOOL ok = WTSQuerySessionInformationW(
+			WTS_CURRENT_SERVER_HANDLE,
+			kTargetSid,
+			WTSConnectState,
+			&pState,
+			&bytes);
+
+		if (!ok) {
+			LogRec(L"[Loop] WTSQuerySessionInformation failed ec=%lu — stopping capture", GetLastError());
+			running = false;
+			break;
+		}
+
+		WTS_CONNECTSTATE_CLASS state = *reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(pState);
+		WTSFreeMemory(pState);
+
+		if (state != WTSActive) {
+			LogRec(L"[Loop] Session not active anymore (state=%d) — stopping capture", (int)state);
+			running = false;
+			break;
+		}
+	}
+
+	LogRec(L"[Loop] Leaving loop, finalizing writer");
+
+	if (writer)
+		writer->Finalize();   // close file
+	MFShutdown();             // release MF
+	CoUninitialize();         // release COM
+
+	SYSTEMTIME stEnd;
+	GetLocalTime(&stEnd);
+
+	wchar_t newPath[MAX_PATH];
+	StringCchPrintfW(newPath, MAX_PATH,
+		L"C:\\REC\\%s_%s_%04u%02u%02u_%02u%02u%02u_%02u%02u%02u.mp4",
+		g_uuid.c_str(), g_session.c_str(),
+		stStart.wYear, stStart.wMonth, stStart.wDay,
+		stStart.wHour, stStart.wMinute, stStart.wSecond,
+		stEnd.wHour, stEnd.wMinute, stEnd.wSecond);
+
+	LogRec(L"[Loop] Attempting rename to include end time");
+
+	if (MoveFileW(videoPath, newPath))
+		LogRec(L"[Loop] Renamed file to %s", newPath);
+	else
+		LogRec(L"[Loop] Rename failed ec=%lu", GetLastError());
+
+	wcscpy_s(videoPath, newPath);
+
+
+
+	UploadFileToHost(videoPath, g_uuid, g_session);
+	LogRec(L"[Loop] UploadFileToHost called");
+
+	// --- Build JSON with uuid, start_time and end_time ---
+
+	SYSTEMTIME stNow;
+	GetLocalTime(&stNow);
+
+	std::wstring json =
+		L"{"
+		L"\"uuid\":\"" + g_uuid + L"\","
+		L"\"start_time\":\"" +
+		std::to_wstring(stStart.wYear) + L"-" +
+		(stStart.wMonth < 10 ? L"0" : L"") + std::to_wstring(stStart.wMonth) + L"-" +
+		(stStart.wDay < 10 ? L"0" : L"") + std::to_wstring(stStart.wDay) + L"T" +
+		(stStart.wHour < 10 ? L"0" : L"") + std::to_wstring(stStart.wHour) + L":" +
+		(stStart.wMinute < 10 ? L"0" : L"") + std::to_wstring(stStart.wMinute) + L":" +
+		(stStart.wSecond < 10 ? L"0" : L"") + std::to_wstring(stStart.wSecond) + L"\","
+		L"\"end_time\":\"" +
+		std::to_wstring(stNow.wYear) + L"-" +
+		(stNow.wMonth < 10 ? L"0" : L"") + std::to_wstring(stNow.wMonth) + L"-" +
+		(stNow.wDay < 10 ? L"0" : L"") + std::to_wstring(stNow.wDay) + L"T" +
+		(stNow.wHour < 10 ? L"0" : L"") + std::to_wstring(stNow.wHour) + L":" +
+		(stNow.wMinute < 10 ? L"0" : L"") + std::to_wstring(stNow.wMinute) + L":" +
+		(stNow.wSecond < 10 ? L"0" : L"") + std::to_wstring(stNow.wSecond) +
+		L"\""
+		L"}";
+
+	std::string body = std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(json);
+	LogRec(L"[QCMREC] Sending recording meta to backend: %s", json.c_str());
+
+	// --- HTTP POST ---
+	HINTERNET hSession = WinHttpOpen(L"QCMREC/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (hSession) {
+		HINTERNET hConnect = WinHttpConnect(hSession, L"192.168.8.199", 9000, 0);
+		if (hConnect) {
+			HINTERNET hMeta = WinHttpOpenRequest(hConnect, L"POST",
+				L"/api/recordings/end", NULL, WINHTTP_NO_REFERER,
+				WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+			if (hMeta) {
+				BOOL ok = WinHttpSendRequest(hMeta,
+					L"Content-Type: application/json\r\n", -1L,
+					(LPVOID)body.c_str(), (DWORD)body.size(),
+					(DWORD)body.size(), 0);
+				if (ok && WinHttpReceiveResponse(hMeta, NULL)) {
+					LogRec(L"[QCMREC] Recording meta POST success");
+				}
+				else {
+					LogRec(L"[QCMREC] Recording meta POST FAILED ec=%lu", GetLastError());
+				}
+				WinHttpCloseHandle(hMeta);
+			}
+			WinHttpCloseHandle(hConnect);
+		}
+		WinHttpCloseHandle(hSession);
+	}
+}
+
+// ---- tiny JSON field extractor: looks for "name":"value" (flat, no escapes) ----
+static std::string ExtractStringField(const std::string& json, const char* name) {
+    std::string key = std::string("\"") + name + "\":";
+    size_t p = json.find(key);
+    if (p == std::string::npos) return {};
+    p += key.size();
+    while (p < json.size() && (json[p] == ' ')) p++;   // skip space
+    if (p >= json.size() || json[p] != '\"') return {};
+    p++; // past opening quote
+    std::string out;
+    while (p < json.size() && json[p] != '\"') out.push_back(json[p++]);
+    return out;
+}
+
+// ---- Base64 decode using WinCrypto (matches your Base64Encode style) ----
+static std::vector<BYTE> Base64Decode(const std::string& b64) {
+    std::vector<BYTE> out;
+    if (b64.empty()) return out;
+    DWORD len = 0;
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(),
+                              CRYPT_STRING_BASE64, nullptr, &len, nullptr, nullptr))
+        return out;
+    out.resize(len);
+    if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(),
+                              CRYPT_STRING_BASE64, out.data(), &len, nullptr, nullptr))
+        return {};
+    out.resize(len);
+    return out;
+}
+
+struct RecKeysSimple {
+	std::string public_pem;
+	std::vector<BYTE> aes;
+};
+
+// ---- HTTP GET /api/recordings/keys -> raw JSON string ----
+static std::string FetchRecordingKeysJSON() {
+    HINTERNET hSession = WinHttpOpen(L"QCMREC/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return "";
+
+    HINTERNET hConnect = WinHttpConnect(hSession, L"192.168.8.199", 9000, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET",
+        L"/api/recordings/keys",   // backend must return {"aes_key":"...","iv":"...","public_key":"PEM..."}
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return ""; }
+
+    std::string result;
+    if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) &&
+        WinHttpReceiveResponse(hRequest, NULL)) {
+        DWORD size = 0;
+        while (WinHttpQueryDataAvailable(hRequest, &size), size > 0) {
+            std::string chunk(size, '\0');
+            DWORD read = 0;
+            if (WinHttpReadData(hRequest, &chunk[0], size, &read) && read) {
+                chunk.resize(read);
+                result.append(chunk);
+            }
+        }
+    }
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+static RecKeysSimple GetRecKeysSimple() {
+	RecKeysSimple rk;
+	std::string js = FetchRecordingKeysJSON();
+
+	std::string aes_b64 = ExtractStringField(js, "aes_key");   // <-- correct field
+rk.public_pem = ExtractStringField(js, "public_key");
+
+rk.aes = Base64Decode(aes_b64);
+if (rk.aes.size() != 32) {
+    LogRec(L"[KEYS] AES size=%u (expected 32).", (unsigned)rk.aes.size());
+}
+return rk;
+}
+
+
+
+// ----------------- Upload to backend -----------------
+static void UploadFileToHost(const std::wstring& filePath,
+	const std::wstring& uuid,
+	const std::wstring& session)
+{
+
+	LogRec(L"UploadFileToHost: %s (UUID=%s, SESSION=%s)",
+		filePath.c_str(), uuid.c_str(), session.c_str());
+
+	auto rk = GetRecKeysSimple();
+	g_rec_aes = rk.aes;
+	g_rec_pub_pem = rk.public_pem;
+	HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) {
+		LogRec(L"Failed to open file for upload. ec=%lu", GetLastError());
+		return;
+	}
+
+	DWORD fileSize = GetFileSize(hFile, NULL);
+	if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+		LogRec(L"Invalid file size: %lu", GetLastError());
+		CloseHandle(hFile);
+		return;
+	}
+
+	BYTE* buffer = new BYTE[fileSize];
+	DWORD bytesRead = 0;
+	if (!ReadFile(hFile, buffer, fileSize, &bytesRead, NULL) || bytesRead != fileSize) {
+		LogRec(L"Failed to read file. ec=%lu", GetLastError());
+		delete[] buffer;
+		CloseHandle(hFile);
+		return;
+	}
+	CloseHandle(hFile);
+
+	//----------------------------------------------------
+// AES encryption here
+//----------------------------------------------------
+
+// create AES context
+	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+	EVP_EncryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, g_rec_aes.data(), NULL);
+
+	// allocate encrypted buffer (slightly bigger)
+	int outlen1 = fileSize + AES_BLOCK_SIZE;
+	BYTE* encBuf = new BYTE[outlen1];
+
+	int len;
+	EVP_EncryptUpdate(ctx, encBuf, &len, buffer, fileSize);
+	int ciphertext_len = len;
+
+	EVP_EncryptFinal_ex(ctx, encBuf + len, &len);
+	ciphertext_len += len;
+	EVP_CIPHER_CTX_free(ctx);
+
+	// free original plain buffer
+	delete[] buffer;
+
+	// replace buffer with encrypted buffer
+	buffer = encBuf;
+	fileSize = ciphertext_len;
+
+	//----------------------------------------------------
+
+
+	HINTERNET hSession = WinHttpOpen(L"QCMREC/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!hSession) {
+		LogRec(L"WinHttpOpen failed ec=%lu", GetLastError());
+		delete[] buffer;
+		return;
+	}
+
+	// --- HOST & PORT HERE --
+	const wchar_t* host = L"192.168.8.199";   // host PC IP
+	INTERNET_PORT port = 9000;                // backend port
+	HINTERNET hConnect = WinHttpConnect(hSession, host, port, 0);
+	if (!hConnect) {
+		LogRec(L"WinHttpConnect failed ec=%lu", GetLastError());
+		WinHttpCloseHandle(hSession);
+		delete[] buffer;
+		return;
+	}
+
+	HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+		L"/api/upload", NULL, WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES,
+		0);
+	if (!hRequest) {
+		LogRec(L"WinHttpOpenRequest failed ec=%lu", GetLastError());
+		WinHttpCloseHandle(hConnect);
+		WinHttpCloseHandle(hSession);
+		delete[] buffer;
+		return;
+	}
+
+	// -- convert AES key to base64 for safe header transfer --
+	DWORD b64_len = 0;
+	CryptBinaryToStringA(g_rec_aes.data(), (DWORD)g_rec_aes.size(),
+		CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64_len);
+
+	std::string aes_b64;
+	aes_b64.resize(b64_len);
+
+	if (!CryptBinaryToStringA(g_rec_aes.data(), (DWORD)g_rec_aes.size(),
+		CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, aes_b64.data(), &b64_len)) {
+		LogRec(L"AES b64 error: %lu", GetLastError());
+		aes_b64.clear();
+	}
+	if (!aes_b64.empty() && aes_b64.back() == '\0') aes_b64.pop_back();
+	std::wstring aesW(rk.aes.begin(), rk.aes.end());
+
+	std::wstringstream hdr;
+	hdr << L"X-UUID: " << uuid << L"\r\n"
+		<< L"X-Session: " << session << L"\r\n"
+		<< L"X-AESKEY: " << aesW << L"\r\n"
+		<< L"X-Filename: session.mp4\r\n";
+	WinHttpAddRequestHeaders(hRequest, hdr.str().c_str(), (ULONG)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+
+
+	WinHttpAddRequestHeaders(
+		hRequest,
+		L"Content-Type: application/octet-stream\r\n",
+		(ULONG)-1L,
+		WINHTTP_ADDREQ_FLAG_ADD
+	);
+
+	// ---- send ENCRYPTED video as the body ----
+	BOOL sent = WinHttpSendRequest(
+		hRequest,
+		WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+		buffer,
+		fileSize,
+		fileSize,
+		0);
+	if (!sent) {
+		LogRec(L"WinHttpSendRequest failed ec=%lu", GetLastError());
+	}
+	else if (!WinHttpReceiveResponse(hRequest, NULL)) {
+		LogRec(L"WinHttpReceiveResponse failed ec=%lu", GetLastError());
+	}
+	else {
+		LogRec(L"Upload done");
+	}
+
+	WinHttpCloseHandle(hRequest);
+	WinHttpCloseHandle(hConnect);
+	WinHttpCloseHandle(hSession);
+	delete[] buffer;
+}
+
+// --- Run capture inside a specific RDP session (service mode) ---
+static void RunCaptureInSession(DWORD targetSession, const std::wstring& uuid)
+{
+	{
+		HANDLE hUserToken = nullptr;
+		if (!WTSQueryUserToken(targetSession, &hUserToken)) {
+			LogRec(L"WTSQueryUserToken failed ec=%lu for sid=%u", GetLastError(), targetSession);
+			return;
+		}
+
+		HANDLE hPrimary = nullptr;
+		if (!DuplicateTokenEx(hUserToken, TOKEN_ALL_ACCESS, nullptr, SecurityIdentification, TokenPrimary, &hPrimary)) {
+			LogRec(L"DuplicateTokenEx failed ec=%lu for sid=%u", GetLastError(), targetSession);
+			CloseHandle(hUserToken);
+			return;
+		}
+		CloseHandle(hUserToken);
+
+		LPVOID env = nullptr;
+		if (!CreateEnvironmentBlock(&env, hPrimary, FALSE)) {
+			LogRec(L"CreateEnvironmentBlock failed ec=%lu (continuing)", GetLastError());
+			env = nullptr;
+		}
+
+		// launch this same exe in user session with args:  start <uuid> <sid>
+		wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+		wchar_t cmd[512];
+		StringCchPrintfW(cmd, 512, L"\"%s\" start %s %u", exe, uuid.c_str(), targetSession);
+
+		STARTUPINFOW si{}; si.cb = sizeof(si);
+		si.lpDesktop = (LPWSTR)L"winsta0\\default";
+		si.dwFlags = STARTF_USESHOWWINDOW;
+		si.wShowWindow = SW_HIDE;
+		PROCESS_INFORMATION pi{};
+		BOOL ok = CreateProcessAsUserW(
+			hPrimary,
+			NULL,
+			cmd,
+			nullptr, nullptr, FALSE,
+			CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+			env,
+			nullptr,
+			&si,
+			&pi
+		);
+		if (!ok) {
+			LogRec(L"CreateProcessAsUserW failed ec=%lu for sid=%u", GetLastError(), targetSession);
+		}
+		else {
+			LogRec(L"Launched QCMREC in session %u (pid=%u)", targetSession, (unsigned)pi.dwProcessId);
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+		}
+
+		if (env) DestroyEnvironmentBlock(env);
+		CloseHandle(hPrimary);
+		// --- NEW: extra diagnostics about process creation ---
+		if (!ok) {
+			DWORD ec = GetLastError();
+			LogRec(L"Diagnostics: CreateProcessAsUserW failed ec=%lu (often means token not interactive or desktop not found)", ec);
+		}
+		else {
+			LogRec(L"Diagnostics: successfully created process in target session %u", targetSession);
+		}
+	}
+
+
+}
+
+// ----------------- TCP Server -----------------
+int RunServiceMode()
+{
+	WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(10444); addr.sin_addr.s_addr = INADDR_ANY;
+	bind(s, (sockaddr*)&addr, sizeof(addr));
+	listen(s, 1);
+
+	SOCKET c = accept(s, NULL, NULL);
+	if (c == INVALID_SOCKET) { closesocket(s); WSACleanup(); return 1; }
+
+	LogRec(L"Accepted connection on 10444 from CJ");
+
+	char buf[256] = {};
+	int len = recv(c, buf, sizeof(buf) - 1, 0);
+
+	if (len <= 0) {
+		closesocket(c);
+		closesocket(s);
+		WSACleanup();
+		return 0;
+	}
+
+	buf[len] = 0;
+	LogRec(L"Received raw: %S", buf);
+
+	std::wstring cmd, uuid, sess;
+	std::wstringstream ss(std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(buf));
+	ss >> cmd >> uuid >> sess;
+
+	LogRec(L"Parsed cmd='%s' uuid='%s' sess='%s'", cmd.c_str(), uuid.c_str(), sess.c_str());
+
+	if (_wcsicmp(cmd.c_str(), L"start") == 0) {
+		LogRec(L"Start command received — UUID=%s SID=%s", uuid.c_str(), sess.c_str());
+		g_uuid = uuid; g_session = sess;
+
+		DWORD sid = _wtoi(sess.c_str());
+		if (sid == 0 || sid == (DWORD)-1) {
+			LogRec(L"Invalid SID received: %s", sess.c_str());
+		}
+		else {
+			RunCaptureInSession(sid, uuid);
+		}
+	}
+	closesocket(c); closesocket(s); WSACleanup();
+	return 0;
+}
+
+// ----------------- Windows Service -----------------
+SERVICE_STATUS gSvcStatus = {};
+SERVICE_STATUS_HANDLE gSvcStatusHandle = nullptr;
+
+void ReportSvcStatus(DWORD state) {
+	gSvcStatus.dwCurrentState = state;
+	gSvcStatus.dwControlsAccepted = (state == SERVICE_START_PENDING) ? 0 : SERVICE_ACCEPT_STOP;
+	gSvcStatus.dwWin32ExitCode = NO_ERROR;
+	gSvcStatus.dwCheckPoint = 0;
+	gSvcStatus.dwWaitHint = 0;
+	SetServiceStatus(gSvcStatusHandle, &gSvcStatus);
+}
+
+void WINAPI SvcCtrlHandler(DWORD ctrl) {
+	if (ctrl == SERVICE_CONTROL_STOP) {
+		ReportSvcStatus(SERVICE_STOP_PENDING);
+		ReportSvcStatus(SERVICE_STOPPED);
+	}
+}
+
+void WINAPI SvcMain(DWORD, LPTSTR*) {
+	gSvcStatusHandle = RegisterServiceCtrlHandler(L"QCMREC", SvcCtrlHandler);
+	if (!gSvcStatusHandle) return;
+
+	ZeroMemory(&gSvcStatus, sizeof(gSvcStatus));
+	gSvcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+
+	ReportSvcStatus(SERVICE_START_PENDING);
+	ReportSvcStatus(SERVICE_RUNNING);
+
+	while (g_running) {
+		RunServiceMode();
+		Sleep(1000);
+	}
+
+	ReportSvcStatus(SERVICE_STOPPED);
+}
+
+// ----------------- main -----------------
+int wmain(int argc, wchar_t** argv)
+{
+	if (argc >= 4 && _wcsicmp(argv[1], L"start") == 0) {
+		g_uuid = argv[2];
+		g_session = argv[3];
+		g_running = true;
+
+		// ---- FULLSCREEN BLACK SCREEN (5 s, centered white text) ----
+		HWND hwnd = CreateWindowExW(
+			WS_EX_TOPMOST,
+			L"STATIC",                     // simple window class
+			L"",                           // we'll draw text ourselves
+			WS_POPUP | WS_VISIBLE,
+			0, 0,
+			GetSystemMetrics(SM_CXSCREEN),
+			GetSystemMetrics(SM_CYSCREEN),
+			nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+		if (hwnd) {
+			HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
+			SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)hBrush);
+
+			HFONT hFont = CreateFontW(
+				75, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+				DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+				DEFAULT_QUALITY, FF_SWISS, L"Segoe UI");
+
+			ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+			UpdateWindow(hwnd);
+
+			HDC hdc = GetDC(hwnd);
+			RECT rc; GetClientRect(hwnd, &rc);
+			FillRect(hdc, &rc, hBrush);
+			SetTextColor(hdc, RGB(255, 255, 255));   // white text
+			SetBkMode(hdc, TRANSPARENT);
+			SelectObject(hdc, hFont);
+			DrawTextW(hdc, L"RECORDING STARTED", -1, &rc,
+				DT_CENTER | DT_VCENTER | DT_SINGLELINE); // <<< centered big
+			ReleaseDC(hwnd, hdc);
+
+			Sleep(30000);   // show 5 s
+
+			DestroyWindow(hwnd);
+			DeleteObject(hFont);
+			DeleteObject(hBrush);
+		}
+		// ---- END FULLSCREEN ----
+
+		std::thread stopper([&] { _getch(); g_running = false; });
+		RunCaptureLoop(g_running);
+		stopper.join();
+		return 0;
+	}
+
+	SERVICE_TABLE_ENTRY DispatchTable[] = {
+		{ (LPWSTR)L"QCMREC", (LPSERVICE_MAIN_FUNCTION)SvcMain },
+		{ NULL, NULL }
+	};
+
+	if (!StartServiceCtrlDispatcher(DispatchTable)) {
+		RunServiceMode();
+	}
+	return 0;
+}
