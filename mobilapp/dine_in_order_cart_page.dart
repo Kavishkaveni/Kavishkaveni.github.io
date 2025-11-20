@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../OrdersPages/order_tracking_page.dart';
+import '../services/qctrade_api.dart';
 
 class DineInOrderCartPage extends StatefulWidget {
   final int tableNumber;
@@ -23,14 +24,42 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
   String selectedCategory = "All";
   TextEditingController searchController = TextEditingController();
 
-  final List<Map<String, dynamic>> menuItems = [
-    {"name": "Burger", "price": 450, "stock": 12, "category": "Food", "image": ""},
-    {"name": "Chicken Rice", "price": 650, "stock": 6, "category": "Food", "image": ""},
-    {"name": "Coke", "price": 180, "stock": 40, "category": "Drink", "image": ""},
-    {"name": "Ice Cream", "price": 150, "stock": 20, "category": "Dessert", "image": ""},
-  ];
+  List<Map<String, dynamic>> menuItems = [];   
+  bool isLoading = true;
 
   final Map<String, int> cart = {};
+
+  @override
+  void initState() {
+    super.initState();
+    loadProducts(); // ← API LOAD
+  }
+
+  Future<void> loadProducts() async {
+  try {
+    final result = await QcTradeApi.getProducts();
+
+    // result is ALREADY a List from API
+    final List<dynamic> data = result;
+
+    // convert backend list → frontend list
+    menuItems = data.map<Map<String, dynamic>>((item) {
+  return {
+    "product_id": item["product_id"],  
+    "name": item["product_name"] ?? "",
+    "price": (item["selling_price"] ?? 0).toInt(),
+    "stock": item["stock"] ?? 0,
+    "category": item["category"] ?? "other",
+    "image": item["image_path"] ?? "",
+  };
+}).toList();
+
+    setState(() => isLoading = false);
+  } catch (e) {
+    print("Product load error: $e");
+    setState(() => isLoading = false);
+  }
+}
 
   void addToCart(String name) {
     setState(() {
@@ -57,14 +86,35 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
     return t;
   }
 
+  Map<String, dynamic> buildOrderPayload() {
+  List<Map<String, dynamic>> items = [];
+
+  cart.forEach((name, qty) {
+    final product = menuItems.firstWhere((i) => i["name"] == name);
+
+    items.add({
+  "product_id": product["product_id"],   // MUST BE STRING ID
+  "quantity": qty,
+  "unit_price": product["price"],
+});
+  });
+
+  return {
+    "order_type": "dinein",
+    "table_id": widget.tableNumber,
+    "total_amount": total.toDouble(),
+    "items": items
+  };
+}
+
   @override
   Widget build(BuildContext context) {
     final bool isMobile = MediaQuery.of(context).size.width < 850;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF7EFE5), // cream background
+      backgroundColor: const Color(0xFFF7EFE5),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF4A2C2A), // dark brown
+        backgroundColor: const Color(0xFF4A2C2A),
         elevation: 0,
         title: Text(
           "Table ${widget.tableNumber} - Orders",
@@ -74,7 +124,9 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
           ),
         ),
       ),
-      body: isMobile ? _mobileLayout() : _desktopLayout(),
+      body: isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : (isMobile ? _mobileLayout() : _desktopLayout()),
     );
   }
 
@@ -98,7 +150,7 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
     );
   }
 
-  // LEFT CART (DESKTOP)
+  // LEFT CART
   Widget _leftOrderSection() {
     return Container(
       color: Colors.white,
@@ -106,10 +158,13 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text("Order Details", style: GoogleFonts.poppins(fontSize: 17, fontWeight: FontWeight.w600)),
-          Text("Table ${widget.tableNumber}", style: GoogleFonts.poppins(color: Colors.grey.shade600)),
+          Text("Order Details",
+              style: GoogleFonts.poppins(fontSize: 17, fontWeight: FontWeight.w600)),
+          Text("Table ${widget.tableNumber}",
+              style: GoogleFonts.poppins(color: Colors.grey.shade600)),
           const SizedBox(height: 14),
-          Text("Order Items", style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
+          Text("Order Items",
+              style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
           const SizedBox(height: 8),
           Expanded(child: _cartList()),
           const SizedBox(height: 10),
@@ -124,8 +179,11 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
   // CART LIST
   Widget _cartList() {
     if (cart.isEmpty) {
-      return Center(child: Text("Your cart is empty", style: GoogleFonts.poppins(color: Colors.grey)));
+      return Center(
+          child: Text("Your cart is empty",
+              style: GoogleFonts.poppins(color: Colors.grey)));
     }
+
     return ListView(
       children: cart.entries.map((e) {
         final item = menuItems.firstWhere((i) => i["name"] == e.key);
@@ -139,11 +197,16 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
           ),
           child: Row(
             children: [
-              Expanded(child: Text(e.key, style: GoogleFonts.poppins(fontWeight: FontWeight.w500))),
-              IconButton(onPressed: () => decreaseItem(e.key),
+              Expanded(
+                  child:
+                      Text(e.key, style: GoogleFonts.poppins(fontWeight: FontWeight.w500))),
+              IconButton(
+                  onPressed: () => decreaseItem(e.key),
                   icon: const Icon(Icons.remove_circle, color: Colors.red)),
-              Text("${e.value}", style: GoogleFonts.poppins(fontWeight: FontWeight.w500)),
-              IconButton(onPressed: () => addToCart(e.key),
+              Text("${e.value}",
+                  style: GoogleFonts.poppins(fontWeight: FontWeight.w500)),
+              IconButton(
+                  onPressed: () => addToCart(e.key),
                   icon: const Icon(Icons.add_circle, color: Colors.green)),
               const SizedBox(width: 8),
               Text("Rs ${item["price"] * e.value}",
@@ -155,12 +218,15 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
     );
   }
 
-  // RIGHT MENU + FILTERS + BUTTONS
+  // RIGHT MENU SECTION
   Widget _rightMenuSection() {
     final filteredMenu = menuItems.where((item) {
-      bool catMatch = selectedCategory == "All" || item["category"] == selectedCategory;
+      bool catMatch =
+          selectedCategory == "All" || item["category"] == selectedCategory;
       bool searchMatch = searchController.text.isEmpty ||
-          item["name"].toLowerCase().contains(searchController.text.toLowerCase());
+          item["name"]
+              .toLowerCase()
+              .contains(searchController.text.toLowerCase());
       return catMatch && searchMatch;
     }).toList();
 
@@ -188,14 +254,20 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
   }
 
   Widget _categories() {
-    final cats = ["All", "Food", "Drink", "Dessert"];
+    // BACKEND CATEGORIES LOADED DYNAMICALLY
+    final Set<String> categories =
+        menuItems.map((i) => i["category"].toString()).toSet();
+
+    final List<String> cats = ["All", ...categories];
+
     return Row(
       children: cats.map((c) {
         bool active = selectedCategory == c;
         return GestureDetector(
           onTap: () => setState(() => selectedCategory = c),
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             margin: const EdgeInsets.only(right: 8),
             decoration: BoxDecoration(
               color: active ? const Color(0xFFB08A58) : Colors.grey.shade200,
@@ -223,8 +295,8 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
         prefixIcon: const Icon(Icons.search, size: 18),
         filled: true,
         fillColor: Colors.white,
-        contentPadding: const EdgeInsets.symmetric(vertical: 0, horizontal: 14),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+        border:
+            OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
       ),
     );
   }
@@ -239,7 +311,10 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: Colors.brown.shade100),
           boxShadow: [
-            BoxShadow(color: Colors.brown.withOpacity(.05), blurRadius: 6, offset: const Offset(2, 2)),
+            BoxShadow(
+                color: Colors.brown.withOpacity(.05),
+                blurRadius: 6,
+                offset: const Offset(2, 2)),
           ],
         ),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -250,13 +325,17 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
                 color: Colors.brown.shade50,
                 borderRadius: BorderRadius.circular(10),
               ),
-              child: const Icon(Icons.fastfood, color: Colors.brown, size: 30),
+              child:
+                  const Icon(Icons.fastfood, color: Colors.brown, size: 30),
             ),
           ),
           const SizedBox(height: 8),
-          Text(item["name"], style: GoogleFonts.poppins(fontWeight: FontWeight.w600, fontSize: 13)),
+          Text(item["name"],
+              style: GoogleFonts.poppins(
+                  fontWeight: FontWeight.w600, fontSize: 13)),
           Text("Rs ${item["price"]}",
-              style: GoogleFonts.poppins(color: Colors.brown.shade700, fontSize: 12)),
+              style: GoogleFonts.poppins(
+                  color: Colors.brown.shade700, fontSize: 12)),
           Text("${item["stock"]} in stock",
               style: GoogleFonts.poppins(color: Colors.grey, fontSize: 11)),
         ]),
@@ -275,45 +354,42 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
         _smallBtn("Settlement", const Color(0xFF4A2C2A), Colors.white),
         const SizedBox(width: 8),
         SizedBox(
-  height: 38,
-  child: ElevatedButton(
-    style: ElevatedButton.styleFrom(
-      backgroundColor: const Color(0xFFB08A58),
-      elevation: 0,
+          height: 38,
+          child: ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFB08A58),
+              elevation: 0,
+            ),
+            onPressed: () async {
+  final orderData = buildOrderPayload();   // Build the order object
+
+  showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) =>
+        const Center(child: CircularProgressIndicator(color: Color(0xFF4A2C2A))),
+  );
+
+  await Future.delayed(const Duration(seconds: 1));
+
+  Navigator.pop(context);
+
+  Navigator.pushReplacement(
+    context,
+    MaterialPageRoute(
+      builder: (_) => OrderTrackingPage(orderData: orderData),
     ),
-    onPressed: () async {
-
-      // show loading popup
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => const Center(
-          child: CircularProgressIndicator(color: Color(0xFF4A2C2A)),
+  );
+},
+            child: Text(
+              "Send to Kitchen",
+              style: GoogleFonts.poppins(
+                color: Colors.white,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
         ),
-      );
-
-      // wait 2 seconds (you can reduce later)
-      await Future.delayed(const Duration(seconds: 2));
-
-      Navigator.pop(context); // close loading
-
-      // navigate to your existing Order Tracking Page
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (_) => const OrderTrackingPage(),
-        ),
-      );
-    },
-    child: Text(
-      "Send to Kitchen",
-      style: GoogleFonts.poppins(
-        color: Colors.white,
-        fontWeight: FontWeight.w500,
-      ),
-    ),
-  ),
-),
       ],
     );
   }
@@ -324,26 +400,32 @@ class _DineInOrderCartPageState extends State<DineInOrderCartPage> {
       child: ElevatedButton(
         style: ElevatedButton.styleFrom(backgroundColor: bg, elevation: 0),
         onPressed: () {},
-        child: Text(text, style: GoogleFonts.poppins(color: fg, fontWeight: FontWeight.w500)),
+        child: Text(text,
+            style:
+                GoogleFonts.poppins(color: fg, fontWeight: FontWeight.w500)),
       ),
     );
   }
 
-  // MOBILE BOTTOM BAR
   Widget _bottomCartButton() {
     if (cart.isEmpty) return const SizedBox();
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: const Color(0xFF4A2C2A),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(.2), blurRadius: 10)],
+        boxShadow: [
+          BoxShadow(
+              color: Colors.black.withOpacity(.2),
+              blurRadius: 10)
+        ],
       ),
       child: GestureDetector(
         onTap: () {},
         child: Row(
           children: [
             Text("View Cart • Rs $total",
-                style: GoogleFonts.poppins(color: Colors.white, fontWeight: FontWeight.w600)),
+                style: GoogleFonts.poppins(
+                    color: Colors.white, fontWeight: FontWeight.w600)),
             const Spacer(),
             const Icon(Icons.shopping_cart, color: Colors.white),
           ],
