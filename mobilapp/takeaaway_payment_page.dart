@@ -4,17 +4,17 @@ import 'package:google_fonts/google_fonts.dart';
 import '../services/qctrade_api.dart';
 
 class TakeAwayPaymentPage extends StatefulWidget {
-  final Map<String, int> cartData;
-  final int totalAmount;
-  final int orderId;
-  final List<Map<String, dynamic>> menuItems;
+  final Map<String, int>? cartData;                
+  final int totalAmount;                          
+  final int orderId;                               
+  final List<Map<String, dynamic>>? menuItems;     
 
   const TakeAwayPaymentPage({
     super.key,
-    required this.cartData,
+    this.cartData,
     required this.totalAmount,
     required this.orderId,
-    required this.menuItems,
+    this.menuItems,
   });
 
   @override
@@ -68,6 +68,9 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
 
   // ORDER SUMMARY
   Widget _orderSummary(int finalTotal, int tax) {
+    final cart = widget.cartData ?? {};
+    final menu = widget.menuItems ?? [];
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: _box(),
@@ -80,13 +83,13 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
 
           const SizedBox(height: 12),
 
-          ...widget.cartData.entries.map((e) {
-            final item = widget.menuItems.firstWhere(
+          ...cart.entries.map((e) {
+            final item = menu.firstWhere(
               (i) => i["product_name"] == e.key,
               orElse: () => {"price": 0},
             );
 
-            int price = item["price"];
+            int price = item["price"] ?? 0;
             int qty = e.value;
             int total = price * qty;
 
@@ -99,7 +102,7 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
                     style: GoogleFonts.poppins(fontSize: 15)),
               ],
             );
-          }),
+          }).toList(),
 
           const Divider(height: 25),
 
@@ -107,7 +110,8 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text("Subtotal:", style: GoogleFonts.poppins()),
-              Text("Rs ${widget.totalAmount}", style: GoogleFonts.poppins()),
+              Text("Rs ${widget.totalAmount}",
+                  style: GoogleFonts.poppins()),
             ],
           ),
           Row(
@@ -258,10 +262,10 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
 
     final validateRes = await QcTradeApi.validateTakeaway(widget.orderId);
 
-if (validateRes == null || validateRes["can_process_payment"] != true) {
-  showInlineMessage("Payment not eligible", false);
-  return;
-}
+    if (validateRes == null || validateRes["can_process_payment"] != true) {
+      showInlineMessage("Payment not eligible", false);
+      return;
+    }
 
     final res = await QcTradeApi.cashPayment(
       orderId: widget.orderId,
@@ -277,12 +281,11 @@ if (validateRes == null || validateRes["can_process_payment"] != true) {
     }
   }
 
-  // CARD UI
+  // CARD & QR UI
   Widget _cardUI(int finalTotal) {
     return _genericPaymentUI("Card Payment", "card", finalTotal);
   }
 
-  // QR UI
   Widget _qrUI(int finalTotal) {
     return _genericPaymentUI("QR Payment", "qr", finalTotal);
   }
@@ -362,7 +365,7 @@ if (validateRes == null || validateRes["can_process_payment"] != true) {
       color: Colors.white,
       borderRadius: BorderRadius.circular(12),
       boxShadow: [
-        BoxShadow(color: Colors.black12, blurRadius: 6, offset: const Offset(0, 3))
+        BoxShadow(color: Colors.black12, blurRadius: 6, offset: const Offset(0, 3)),
       ],
     );
   }
