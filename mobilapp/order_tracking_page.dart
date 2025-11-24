@@ -2,7 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 class OrderTrackingPage extends StatefulWidget {
-  const OrderTrackingPage({super.key});
+  final Map<String, dynamic> orderData;
+
+  const OrderTrackingPage({
+    super.key,
+    required this.orderData,
+  });
 
   @override
   State<OrderTrackingPage> createState() => _OrderTrackingPageState();
@@ -10,79 +15,94 @@ class OrderTrackingPage extends StatefulWidget {
 
 class _OrderTrackingPageState extends State<OrderTrackingPage> {
   int? selectedOrderIndex;
+  late List<Map<String, dynamic>> orders;
 
-  final List<Map<String, dynamic>> orders = [
-    {
-      "table": 150,
-      "orderNo": 4,
-      "customer": "Walk-in Customer",
-      "status": "Pending",
-      "items": [
-        {"name": "Burger", "qty": 1, "price": 100}
-      ],
-      "subtotal": 100,
-      "tax": 10,
-      "total": 110,
-      "date": "11/18/2025, 7:24:55 AM"
-    },
-    {
-      "table": 900,
-      "orderNo": 3,
-      "customer": "Walk-in Customer",
-      "status": "Pending",
-      "items": [
-        {"name": "Rice", "qty": 2, "price": 100}
-      ],
-      "subtotal": 200,
-      "tax": 20,
-      "total": 220,
-      "date": "11/18/2025, 7:25:55 AM"
-    },
-    {
-      "table": 400,
-      "orderNo": 2,
-      "customer": "Walk-in Customer",
-      "status": "Pending",
-      "items": [
-        {"name": "Cheese", "qty": 1, "price": 100}
-      ],
-      "subtotal": 100,
-      "tax": 10,
-      "total": 110,
-      "date": "11/18/2025, 7:27:55 AM"
-    }
-  ];
+  final Color primaryBlue = const Color(0xFF1565C0);
+  final Color lightBlue = const Color(0xFFE3F2FD);
+  final Color accentBlue = const Color(0xFF1E88E5);
+  final Color tagBlue = const Color(0xFF64B5F6);
 
-  Color brown = const Color(0xFF4A2C2A);
-  Color beige = const Color(0xFFF7EFE5);
+  @override
+  void initState() {
+    super.initState();
+
+    orders = [
+      {
+        "table": widget.orderData["table_id"] ??
+            widget.orderData["table_number"] ??
+            0,
+        "orderNo": widget.orderData["id"] ?? 1,
+        "customer": widget.orderData["customer"] ??
+            widget.orderData["customer_name"] ??
+            "Walk-in Customer",
+        "status": widget.orderData["status"] ?? "pending",
+        "items": (widget.orderData["items"] ?? []).map((it) {
+          return {
+            "product_name": it["product_name"] ??
+                it["name"] ??
+                it["product"] ??
+                "Unknown Item",
+            "quantity": it["quantity"] ?? it["qty"] ?? 1,
+            "unit_price": it["unit_price"] ?? it["price"] ?? 0,
+          };
+        }).toList(),
+        "subtotal":
+            widget.orderData["subtotal"] ?? widget.orderData["total_amount"],
+        "tax": widget.orderData["tax"] ?? 0,
+        "total":
+            widget.orderData["total"] ?? widget.orderData["total_amount"],
+        "date": DateTime.now().toString(),
+      }
+    ];
+
+    selectedOrderIndex = 0;
+  }
 
   @override
   Widget build(BuildContext context) {
+    final bool isMobile = MediaQuery.of(context).size.width < 850;
+
     return Scaffold(
-      backgroundColor: beige,
+      backgroundColor: lightBlue,
       appBar: AppBar(
         elevation: 0,
-        backgroundColor: brown,
+        backgroundColor: primaryBlue,
         title: Text(
           "Order Tracking",
           style: GoogleFonts.poppins(
-              color: Colors.white, fontWeight: FontWeight.w600),
+            color: Colors.white,
+            fontWeight: FontWeight.w600,
+          ),
         ),
       ),
-      body: Row(
-        children: [
-          _leftSideOrderList(),
-          Expanded(
-            child: selectedOrderIndex == null
-                ? _emptyRightSideView()
-                : _orderDetailsView(),
-          ),
-        ],
-      ),
+      body: isMobile ? _mobileView() : _desktopView(),
     );
   }
 
-  // ================= LEFT SIDE ORDER LIST =================
+  // MOBILE VIEW SAFE — Scroll Enabled
+  Widget _mobileView() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(18),
+      child: _orderDetailsView(orders[selectedOrderIndex!]),
+    );
+  }
+
+  // DESKTOP VIEW SAFE — Right Side Scroll Enabled
+  Widget _desktopView() {
+    return Row(
+      children: [
+        _leftSideOrderList(),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(18),
+            child: _orderDetailsView(orders[selectedOrderIndex!]),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // LEFT SIDE ORDER LIST
   Widget _leftSideOrderList() {
     return Container(
       width: 300,
@@ -100,39 +120,45 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
               margin: const EdgeInsets.only(bottom: 10),
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
-                color: active ? beige : Colors.white,
+                color: active ? lightBlue : Colors.white,
                 borderRadius: BorderRadius.circular(10),
                 border: Border.all(
-                  color: active ? brown : Colors.grey.shade300,
-                  width: active ? 1.5 : 1,
+                  color: active ? primaryBlue : Colors.grey.shade300,
+                  width: active ? 1.3 : 1,
                 ),
-                boxShadow: [
-                  BoxShadow(
-                      color: Colors.black.withOpacity(.05),
-                      blurRadius: 4,
-                      offset: const Offset(1, 2))
-                ],
               ),
               child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text("Table ${ord["table"]} - #${ord["orderNo"]}",
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Table ${ord["table"]} - #${ord["orderNo"]}",
+                    style: GoogleFonts.poppins(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                  Text(
+                    ord["customer"],
+                    style: GoogleFonts.poppins(
+                      fontSize: 11,
+                      color: Colors.grey,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      _statusTag(ord["status"]!),
+                      Text(
+                        "Rs ${ord["subtotal"]}",
                         style: GoogleFonts.poppins(
-                            fontWeight: FontWeight.w600, fontSize: 13)),
-                    Text(ord["customer"],
-                        style: GoogleFonts.poppins(
-                            fontSize: 11, color: Colors.grey)),
-                    const SizedBox(height: 6),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        _statusTag(ord["status"]!),
-                        Text("Rs ${ord["subtotal"]}",
-                            style: GoogleFonts.poppins(
-                                fontWeight: FontWeight.w600))
-                      ],
-                    )
-                  ]),
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  )
+                ],
+              ),
             ),
           );
         },
@@ -144,39 +170,32 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: Colors.orange.shade100,
+        color: tagBlue.withOpacity(0.2),
         borderRadius: BorderRadius.circular(20),
       ),
       child: Text(
         status,
         style: GoogleFonts.poppins(
-            fontSize: 10, fontWeight: FontWeight.w500, color: Colors.orange),
+          fontSize: 10,
+          fontWeight: FontWeight.w500,
+          color: accentBlue,
+        ),
       ),
     );
   }
 
-  // ================= WHEN NOTHING SELECTED =================
-  Widget _emptyRightSideView() {
-    return Center(
-      child: Text(
-        "Select an Order",
-        style: GoogleFonts.poppins(
-            fontSize: 18, color: Colors.grey, fontWeight: FontWeight.w500),
-      ),
-    );
-  }
-
-  // ================= RIGHT SIDE MAIN CONTENT =================
-  Widget _orderDetailsView() {
-    final order = orders[selectedOrderIndex!];
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(20),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+  // RIGHT SIDE ORDER DETAILS (scroll safe)
+  Widget _orderDetailsView(Map order) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
         Text(
           "Table ${order["table"]} - Order #${order["orderNo"]}",
           style: GoogleFonts.poppins(
-              fontWeight: FontWeight.w700, fontSize: 19, color: brown),
+            fontWeight: FontWeight.w700,
+            fontSize: 19,
+            color: primaryBlue,
+          ),
         ),
         Text(order["customer"],
             style: GoogleFonts.poppins(fontSize: 12, color: Colors.grey)),
@@ -190,118 +209,163 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
         _orderItemsCard(order["items"]),
         const SizedBox(height: 18),
 
-        _paymentSummaryCard(order["subtotal"], order["tax"], order["total"]),
-      ]),
-    );
-  }
-
-  // ================= ORDER PROGRESS CARD =================
-  Widget _orderProgressCard(String status) {
-    return _card(
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text("Order Progress",
-            style: GoogleFonts.poppins(
-                fontWeight: FontWeight.w600, fontSize: 15, color: brown)),
-        const SizedBox(height: 14),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            _progressStep("Pending", Icons.inventory_2, status == "Pending"),
-            _progressStep("Kitchen In Progress", Icons.cookie, false),
-            _progressStep("Preparing", Icons.restaurant, false),
-            _progressStep("Pay", Icons.attach_money, false),
-            _progressStep("Completed", Icons.verified, false),
-          ],
+        _paymentSummaryCard(
+          order["subtotal"],
+          order["tax"],
+          order["total"],
         ),
-      ]),
-    );
-  }
-
-  Widget _progressStep(String label, IconData icon, bool active) {
-    return Column(
-      children: [
-        CircleAvatar(
-          backgroundColor: active ? brown : Colors.grey.shade300,
-          child: Icon(icon, color: Colors.white, size: 18),
-        ),
-        const SizedBox(height: 6),
-        Text(label,
-            style: GoogleFonts.poppins(
-                fontSize: 10,
-                fontWeight: FontWeight.w500,
-                color: active ? brown : Colors.grey)),
       ],
     );
   }
 
-  // ================= ORDER ITEMS CARD =================
-  Widget _orderItemsCard(List items) {
+  // PROGRESS CARD — MOBILE Horizontal scroll FIXED
+  Widget _orderProgressCard(String status) {
     return _card(
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text("Order Items",
-            style: GoogleFonts.poppins(
-                fontWeight: FontWeight.w600, fontSize: 15, color: brown)),
-        const SizedBox(height: 12),
-        Column(
-          children: items.map((item) {
-            return Container(
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              decoration: const BoxDecoration(
-                  border:
-                      Border(bottom: BorderSide(color: Colors.grey, width: .2))),
-              child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text("${item["name"]} × ${item["qty"]}",
-                        style: GoogleFonts.poppins()),
-                    Text("Rs ${item["qty"] * item["price"]}",
-                        style: GoogleFonts.poppins(fontWeight: FontWeight.w600))
-                  ]),
-            );
-          }).toList(),
-        ),
-      ]),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text("Order Progress",
+              style: GoogleFonts.poppins(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 15,
+                  color: primaryBlue)),
+          const SizedBox(height: 14),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _progressStep("Pending", Icons.inventory_2,
+                    status == "pending"),
+                _progressStep("Kitchen", Icons.cookie, false),
+                _progressStep("Preparing", Icons.restaurant, false),
+                _progressStep("Pay", Icons.attach_money, false),
+                _progressStep("Completed", Icons.verified, false),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
-  // ================= PAYMENT SUMMARY CARD =================
+  Widget _progressStep(String label, IconData icon, bool active) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 18),
+      child: Column(
+        children: [
+          CircleAvatar(
+            backgroundColor: active ? primaryBlue : Colors.grey.shade300,
+            child: Icon(icon, color: Colors.white, size: 18),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            style: GoogleFonts.poppins(
+              fontSize: 10,
+              fontWeight: FontWeight.w500,
+              color: active ? primaryBlue : Colors.grey,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ORDER ITEMS
+  Widget _orderItemsCard(List items) {
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text("Order Items",
+              style: GoogleFonts.poppins(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 15,
+                  color: primaryBlue)),
+          const SizedBox(height: 12),
+          Column(
+            children: items.map((item) {
+              final name = item["product_name"] ?? "Item";
+              final qty = item["quantity"] ?? 1;
+              final price = item["unit_price"] ?? 0;
+
+              return Container(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                decoration: const BoxDecoration(
+                  border: Border(
+                      bottom: BorderSide(color: Colors.grey, width: .2)),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text("$name × $qty", style: GoogleFonts.poppins()),
+                    Text("Rs ${qty * price}",
+                        style: GoogleFonts.poppins(
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // PAYMENT SUMMARY
   Widget _paymentSummaryCard(int subtotal, int tax, int total) {
     return _card(
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text("Payment Summary",
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            "Payment Summary",
             style: GoogleFonts.poppins(
-                fontWeight: FontWeight.w600, fontSize: 15, color: brown)),
-        const SizedBox(height: 10),
-        _summaryRow("Main Order Subtotal", subtotal),
-        _summaryRow("Tax (10%)", tax),
-        const Divider(),
-        _summaryRow("Total", total, isBold: true, isGreen: true),
-        const SizedBox(height: 10),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-              color: Colors.yellow.shade100,
-              borderRadius: BorderRadius.circular(8)),
-          child: Text("Payment Pending",
-              style: GoogleFonts.poppins(color: Colors.orange)),
-        ),
-      ]),
+              fontWeight: FontWeight.w600,
+              fontSize: 15,
+              color: primaryBlue,
+            ),
+          ),
+          const SizedBox(height: 10),
+          _summaryRow("Main Order Subtotal", subtotal),
+          _summaryRow("Tax (10%)", tax),
+          const Divider(),
+          _summaryRow("Total", total, isBold: true, isBlue: true),
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: Colors.lightBlue.shade100,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              "Payment Pending",
+              style: GoogleFonts.poppins(color: primaryBlue),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _summaryRow(String title, int amount,
-      {bool isBold = false, bool isGreen = false}) {
+      {bool isBold = false, bool isBlue = false}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        Text(title, style: GoogleFonts.poppins(fontSize: 12)),
-        Text("Rs $amount",
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(title, style: GoogleFonts.poppins(fontSize: 12)),
+          Text(
+            "Rs $amount",
             style: GoogleFonts.poppins(
               fontSize: 13,
               fontWeight: isBold ? FontWeight.bold : FontWeight.w500,
-              color: isGreen ? Colors.green : Colors.black,
-            ))
-      ]),
+              color: isBlue ? primaryBlue : Colors.black,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -309,14 +373,16 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
+      margin: const EdgeInsets.only(bottom: 14),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(14),
         boxShadow: [
           BoxShadow(
-              color: Colors.black.withOpacity(.06),
-              blurRadius: 6,
-              offset: const Offset(2, 3)),
+            color: Colors.black.withOpacity(.06),
+            blurRadius: 6,
+            offset: const Offset(2, 3),
+          ),
         ],
       ),
       child: child,
