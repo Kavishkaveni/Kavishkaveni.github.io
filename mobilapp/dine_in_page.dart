@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../OrdersPages/dine_in_order_cart_page.dart';
+import '../services/qctrade_api.dart';
 
 class DineInPage extends StatefulWidget {
   const DineInPage({super.key});
@@ -14,13 +15,8 @@ class _DineInPageState extends State<DineInPage> {
   String selectedFilter = "All";
   TextEditingController searchController = TextEditingController();
 
-  final List<Map<String, dynamic>> tables = [
-    {"number": 100, "section": "Window", "status": "Occupied"},
-    {"number": 300, "section": "Window", "status": "Cleaning"},
-    {"number": 200, "section": "Window", "status": "Occupied"},
-    {"number": 150, "section": "Window", "status": "Available"},
-    {"number": 180, "section": "Window", "status": "Reserved"},
-  ];
+  List<Map<String, dynamic>> tables = [];
+  bool isLoading = true;
 
   Color statusColor(String status) {
     switch (status) {
@@ -38,9 +34,15 @@ class _DineInPageState extends State<DineInPage> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    loadTables();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xfff7f5f0), // modern restaurant cream bg
+      backgroundColor: const Color(0xfff7f5f0),
       appBar: AppBar(
         elevation: 0,
         backgroundColor: Colors.white,
@@ -55,7 +57,7 @@ class _DineInPageState extends State<DineInPage> {
         ),
       ),
       body: Padding(
-        padding: const EdgeInsets.all(18),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -68,78 +70,99 @@ class _DineInPageState extends State<DineInPage> {
     );
   }
 
-  // FILTER + SEARCH
-  Widget _filtersRow() {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(.05),
-            blurRadius: 6,
-          )
-        ],
-      ),
-      padding: const EdgeInsets.all(12),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 240,
-            child: TextField(
-              controller: searchController,
-              onChanged: (_) => setState(() {}),
-              decoration: InputDecoration(
-                prefixIcon: const Icon(Icons.search, size: 18),
-                hintText: "Search table...",
-                filled: true,
-                fillColor: Colors.grey.shade100,
-                contentPadding: const EdgeInsets.symmetric(horizontal: 14),
-                border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    borderSide: BorderSide.none),
-              ),
+  // FILTER LINE (Optimized for Mobile)
+Widget _filtersRow() {
+  return Container(
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(14),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withOpacity(.05),
+          blurRadius: 6,
+        )
+      ],
+    ),
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8), // smaller
+    child: Row(
+      children: [
+        SizedBox(
+          width: 180, // was 240 → now mobile-friendly
+          height: 42, // fixed search box height
+          child: TextField(
+            controller: searchController,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              prefixIcon: const Icon(Icons.search, size: 18),
+              hintText: "Search...",
+              filled: true,
+              fillColor: Colors.grey.shade100,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 10),
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide.none),
             ),
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: ["All", "Available", "Occupied", "Reserved", "Cleaning"]
-                    .map((f) => _chip(f))
-                    .toList(),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+        ),
+        const SizedBox(width: 10),
 
-  // modern chip
+        // Filter chips
+        Expanded(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: ["All", "Available", "Occupied", "Reserved", "Cleaning"]
+                  .map((f) => _chip(f))
+                  .toList(),
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+  // FILTER CHIP (Option 2 style)
   Widget _chip(String label) {
     bool active = label == selectedFilter;
+    final color = statusColor(label);
+
     return GestureDetector(
       onTap: () => setState(() => selectedFilter = label),
       child: Container(
         margin: const EdgeInsets.only(right: 8),
         padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 7),
         decoration: BoxDecoration(
-          color: active ? statusColor(label).withOpacity(.15) : Colors.grey.shade200,
+          color: Colors.white,
           borderRadius: BorderRadius.circular(30),
           border: Border.all(
-            color: active ? statusColor(label) : Colors.transparent,
-            width: 1,
+            color: active ? color : color.withOpacity(.40),
+            width: 1.3,
           ),
         ),
-        child: Text(
-          label,
-          style: GoogleFonts.poppins(
-            fontSize: 13,
-            fontWeight: FontWeight.w500,
-            color: active ? statusColor(label) : Colors.black87,
-          ),
+        child: Row(
+          children: [
+            // colored dot
+            Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                color: color,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 8),
+
+            // text
+            Text(
+              label,
+              style: GoogleFonts.poppins(
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: active ? color : Colors.black87,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -147,15 +170,20 @@ class _DineInPageState extends State<DineInPage> {
 
   // TABLE GRID
   Widget _tableGrid() {
+    if (isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
     final filtered = tables.where((t) {
-      final matchStatus = selectedFilter == "All" || selectedFilter == t["status"];
+      final matchStatus =
+          selectedFilter == "All" || selectedFilter == t["status"];
       final matchSearch = searchController.text.isEmpty ||
           t["number"].toString().contains(searchController.text);
       return matchStatus && matchSearch;
     }).toList();
 
     return LayoutBuilder(builder: (context, constraints) {
-      int columns = (constraints.maxWidth ~/ 170).clamp(1, 5);
+      int columns = (constraints.maxWidth ~/ 150).clamp(1, 5);
 
       return GridView.builder(
         itemCount: filtered.length,
@@ -163,14 +191,14 @@ class _DineInPageState extends State<DineInPage> {
           crossAxisCount: columns,
           crossAxisSpacing: 16,
           mainAxisSpacing: 16,
-          childAspectRatio: 1.05,
+          childAspectRatio: 0.82,
         ),
         itemBuilder: (_, i) => _tableCard(filtered[i]),
       );
     });
   }
 
-  // TABLE CARD MODERN
+  // TABLE CARD — improved
   Widget _tableCard(Map<String, dynamic> table) {
     final status = table["status"];
     final color = statusColor(status);
@@ -192,31 +220,32 @@ class _DineInPageState extends State<DineInPage> {
           : null,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
-        padding: const EdgeInsets.all(14),
+        padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(18),
           border: Border.all(
-            color: status == "Available"
-                ? Colors.green.withOpacity(.40)
-                : Colors.grey.shade300,
-            width: 1.2,
+            color: color.withOpacity(.50),
+            width: status == "Available" ? 2.0 : 1.2,
           ),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(.045),
-              blurRadius: 6,
+              color: Colors.black.withOpacity(.04),
+              blurRadius: 5,
               offset: const Offset(1, 2),
             )
           ],
         ),
+
+        // Smaller card size
         child: Column(
           children: [
             // status badge
             Align(
               alignment: Alignment.topRight,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                 decoration: BoxDecoration(
                   color: color.withOpacity(.15),
                   borderRadius: BorderRadius.circular(20),
@@ -224,16 +253,19 @@ class _DineInPageState extends State<DineInPage> {
                 child: Text(
                   status,
                   style: GoogleFonts.poppins(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
-                      color: color),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: color,
+                  ),
                 ),
               ),
             ),
+
             const Spacer(),
-            // table circle
+
+            // Bigger circle
             Container(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(22),
               decoration: BoxDecoration(
                 color: color,
                 shape: BoxShape.circle,
@@ -241,17 +273,20 @@ class _DineInPageState extends State<DineInPage> {
               child: Text(
                 "${table["number"]}",
                 style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold),
+                  color: Colors.white,
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
+
             const Spacer(),
+
             Text(
               "Table ${table["number"]}",
               style: GoogleFonts.poppins(
                 fontWeight: FontWeight.w600,
-                fontSize: 14.5,
+                fontSize: 14,
                 color: Colors.brown.shade700,
               ),
             ),
@@ -260,5 +295,35 @@ class _DineInPageState extends State<DineInPage> {
         ),
       ),
     );
+  }
+
+  // API CALL
+  Future<void> loadTables() async {
+    try {
+      final data = await QcTradeApi.getTables();
+
+      setState(() {
+        tables = data.map<Map<String, dynamic>>((t) {
+          return {
+            "number": int.tryParse(t["table_number"].toString()) ?? 0,
+            "status": (t["status"] ?? "").toString().capitalizeFirstLetter(),
+            "section": t["section"] ?? "",
+          };
+        }).toList();
+
+        isLoading = false;
+      });
+    } catch (e) {
+      print("Error loading tables: $e");
+      setState(() => isLoading = false);
+    }
+  }
+}
+
+// EXTENSION FOR CAPITALIZING STATUS
+extension StringExtension on String {
+  String capitalizeFirstLetter() {
+    if (isEmpty) return this;
+    return this[0].toUpperCase() + substring(1);
   }
 }
