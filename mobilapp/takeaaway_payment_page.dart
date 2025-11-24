@@ -4,16 +4,16 @@ import 'package:google_fonts/google_fonts.dart';
 import '../services/qctrade_api.dart';
 
 class TakeAwayPaymentPage extends StatefulWidget {
-  final Map<String, int>? cartData;                
-  final int totalAmount;                          
-  final int orderId;                               
-  final List<Map<String, dynamic>>? menuItems;     
+  final int orderId;
+  final double totalAmount;                       
+  final Map<String, int>? cartData;
+  final List<Map<String, dynamic>>? menuItems;
 
   const TakeAwayPaymentPage({
     super.key,
-    this.cartData,
-    required this.totalAmount,
     required this.orderId,
+    required this.totalAmount,
+    this.cartData,
     this.menuItems,
   });
 
@@ -22,23 +22,42 @@ class TakeAwayPaymentPage extends StatefulWidget {
 }
 
 class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
+  Map<String, dynamic>? settlementData;
+  bool loading = true;
+
   String selectedPayment = "";
-  String inlineMessage = "";
-  bool inlineMessageSuccess = false;
 
-  TextEditingController cashAmount = TextEditingController();
+  @override
+  void initState() {
+    super.initState();
+    loadSettlementMessage();
+  }
 
-  void showInlineMessage(String msg, bool success) {
-    setState(() {
-      inlineMessage = msg;
-      inlineMessageSuccess = success;
-    });
+  Future<void> loadSettlementMessage() async {
+    final res = await QcTradeApi.get(
+        "${QcTradeApi.baseUrl}/orders/${widget.orderId}/validate-for-settlement"
+    );
+
+    settlementData = res;
+    loading = false;
+    setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
-    int tax = (widget.totalAmount * 0.10).toInt();
-    int finalTotal = widget.totalAmount + tax;
+    if (loading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    // FIXED: Backend returns double
+    final double subtotal =
+        (settlementData?["total_amount"] as num?)?.toDouble() ??
+            widget.totalAmount;
+
+    final String validationMsg =
+        settlementData?["validation_message"] ?? "No message";
 
     return Scaffold(
       appBar: AppBar(
@@ -47,93 +66,62 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
                 fontWeight: FontWeight.w600, color: Colors.white)),
         backgroundColor: Colors.teal,
       ),
+
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
-            _orderSummary(finalTotal, tax),
-            const SizedBox(height: 20),
-            _paymentOptions(),
-            const SizedBox(height: 20),
-
-            if (selectedPayment == "Cash") _cashUI(finalTotal),
-            if (selectedPayment == "Card") _cardUI(finalTotal),
-            if (selectedPayment == "QR") _qrUI(finalTotal),
-            if (selectedPayment == "Credit") _creditUI(finalTotal),
+            _paymentSummary(subtotal, validationMsg),
+            const SizedBox(height: 18),
+            _mainOrderItems(),
+            const SizedBox(height: 18),
+            _paymentMethodCard(),
           ],
         ),
       ),
     );
   }
 
-  // ORDER SUMMARY
-  Widget _orderSummary(int finalTotal, int tax) {
-    final cart = widget.cartData ?? {};
-    final menu = widget.menuItems ?? [];
-
+  // ---------------- PAYMENT SUMMARY --------------------
+  Widget _paymentSummary(double subtotal, String message) {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: _box(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text("Order Summary",
+          Text("Payment Summary",
               style: GoogleFonts.poppins(
-                  fontSize: 17, fontWeight: FontWeight.w600)),
+                  fontWeight: FontWeight.w700, fontSize: 16)),
 
-          const SizedBox(height: 12),
-
-          ...cart.entries.map((e) {
-            final item = menu.firstWhere(
-              (i) => i["product_name"] == e.key,
-              orElse: () => {"price": 0},
-            );
-
-            int price = item["price"] ?? 0;
-            int qty = e.value;
-            int total = price * qty;
-
-            return Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text("${e.key} x$qty",
-                    style: GoogleFonts.poppins(fontSize: 15)),
-                Text("Rs $total",
-                    style: GoogleFonts.poppins(fontSize: 15)),
-              ],
-            );
-          }).toList(),
-
-          const Divider(height: 25),
+          const SizedBox(height: 8),
 
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text("Subtotal:", style: GoogleFonts.poppins()),
-              Text("Rs ${widget.totalAmount}",
-                  style: GoogleFonts.poppins()),
-            ],
-          ),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text("Tax (10%):", style: GoogleFonts.poppins()),
-              Text("Rs $tax", style: GoogleFonts.poppins()),
+              Icon(Icons.check_circle,
+                  color: Colors.green.shade600, size: 20),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  message,
+                  style: GoogleFonts.poppins(
+                      color: Colors.green.shade800, fontSize: 14),
+                ),
+              )
             ],
           ),
 
           const SizedBox(height: 10),
+          Divider(),
+
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text("Total:",
+              Text("Main Order Subtotal",
+                  style: GoogleFonts.poppins(fontSize: 14)),
+              Text("Rs ${subtotal.toStringAsFixed(2)}",
                   style: GoogleFonts.poppins(
-                      fontSize: 17, fontWeight: FontWeight.w700)),
-              Text("Rs $finalTotal",
-                  style: GoogleFonts.poppins(
-                      fontSize: 17,
-                      fontWeight: FontWeight.w700,
-                      color: Colors.green)),
+                      fontWeight: FontWeight.w700, fontSize: 14)),
             ],
           ),
         ],
@@ -141,9 +129,18 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
     );
   }
 
-  // PAYMENT OPTIONS
-  Widget _paymentOptions() {
-    List<String> options = ["Cash", "Card", "QR", "Credit"];
+  // ---------------- ORDER ITEMS --------------------
+  Widget _mainOrderItems() {
+    if (widget.cartData == null ||
+        widget.menuItems == null ||
+        widget.cartData!.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: _box(),
+        child: Text("No order items available",
+            style: GoogleFonts.poppins()),
+      );
+    }
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -151,14 +148,62 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text("Select Payment Method",
+          Text("Main Order Items",
+              style: GoogleFonts.poppins(
+                  fontSize: 15, fontWeight: FontWeight.w600)),
+
+          const SizedBox(height: 10),
+
+          ...widget.cartData!.entries.map((e) {
+            final item = widget.menuItems!.firstWhere(
+              (i) => i["product_name"] == e.key,
+              orElse: () => {"price": 0},
+            );
+
+            // FIXED: price from backend is DOUBLE
+            double price =
+                (item["price"] as num?)?.toDouble() ?? 0.0;
+
+            int qty = e.value;
+            double total = price * qty;
+
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text("${e.key} × $qty",
+                      style: GoogleFonts.poppins()),
+                  Text("Rs ${total.toStringAsFixed(2)}",
+                      style: GoogleFonts.poppins(
+                          fontWeight: FontWeight.w600)),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  // ---------------- PAYMENT METHOD --------------------
+  Widget _paymentMethodCard() {
+    List<String> methods = ["Cash", "Card", "QR", "Credit"];
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: _box(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text("Payment Method",
               style: GoogleFonts.poppins(
                   fontSize: 16, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 10),
+          const SizedBox(height: 16),
 
           Wrap(
             spacing: 12,
-            children: options.map((o) => _paymentButton(o)).toList(),
+            children: methods.map((m) => _paymentButton(m)).toList(),
           )
         ],
       ),
@@ -171,7 +216,7 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
     return GestureDetector(
       onTap: () => setState(() => selectedPayment = type),
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 22),
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
         decoration: BoxDecoration(
           color: selected ? Colors.teal : Colors.white,
           border: Border.all(color: Colors.teal),
@@ -187,185 +232,17 @@ class _TakeAwayPaymentPageState extends State<TakeAwayPaymentPage> {
     );
   }
 
-  // CASH UI
-  Widget _cashUI(int finalTotal) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: _box(),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text("Cash Payment",
-              style: GoogleFonts.poppins(
-                  fontSize: 18, fontWeight: FontWeight.w700)),
-
-          const SizedBox(height: 10),
-          Text("Total Amount: Rs $finalTotal",
-              style: GoogleFonts.poppins(fontSize: 16)),
-
-          const SizedBox(height: 15),
-          TextField(
-            controller: cashAmount,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: "Enter paid amount",
-              border: OutlineInputBorder(),
-            ),
-          ),
-
-          const SizedBox(height: 15),
-
-          if (inlineMessage.isNotEmpty)
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: inlineMessageSuccess
-                    ? Colors.green.shade100
-                    : Colors.red.shade100,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                inlineMessage,
-                textAlign: TextAlign.center,
-                style: GoogleFonts.poppins(
-                    color: inlineMessageSuccess
-                        ? Colors.green.shade900
-                        : Colors.red.shade900),
-              ),
-            ),
-
-          const SizedBox(height: 15),
-          ElevatedButton(
-            onPressed: () => _handleCashPayment(finalTotal),
-            style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.teal, minimumSize: const Size(200, 45)),
-            child: Text("Confirm", style: GoogleFonts.poppins()),
-          )
-        ],
-      ),
-    );
-  }
-
-  Future<void> _handleCashPayment(int finalTotal) async {
-    if (cashAmount.text.isEmpty) {
-      showInlineMessage("Enter cash amount", false);
-      return;
-    }
-
-    int received = int.parse(cashAmount.text);
-    if (received < finalTotal) {
-      showInlineMessage("Paid amount is less than total", false);
-      return;
-    }
-
-    int balance = received - finalTotal;
-
-    final validateRes = await QcTradeApi.validateTakeaway(widget.orderId);
-
-    if (validateRes == null || validateRes["can_process_payment"] != true) {
-      showInlineMessage("Payment not eligible", false);
-      return;
-    }
-
-    final res = await QcTradeApi.cashPayment(
-      orderId: widget.orderId,
-      totalAmount: finalTotal,
-      paymentAmount: received,
-      returnAmount: balance,
-    );
-
-    if (res != null) {
-      showInlineMessage("Payment Successful! Balance Rs $balance", true);
-    } else {
-      showInlineMessage("Payment Failed", false);
-    }
-  }
-
-  // CARD & QR UI
-  Widget _cardUI(int finalTotal) {
-    return _genericPaymentUI("Card Payment", "card", finalTotal);
-  }
-
-  Widget _qrUI(int finalTotal) {
-    return _genericPaymentUI("QR Payment", "qr", finalTotal);
-  }
-
-  Widget _genericPaymentUI(String title, String method, int finalTotal) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: _box(),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title,
-              style: GoogleFonts.poppins(
-                  fontSize: 18, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 10),
-          Text("Total Amount: Rs $finalTotal",
-              style: GoogleFonts.poppins(fontSize: 16)),
-          const SizedBox(height: 15),
-
-          ElevatedButton(
-            onPressed: () async {
-              bool ok = await QcTradeApi.processCardOrQrPayment(
-                orderId: widget.orderId,
-                totalAmount: finalTotal,
-                method: method,
-              );
-
-              if (ok) {
-                showInlineMessage("$title Successful!", true);
-              } else {
-                showInlineMessage("$title Failed!", false);
-              }
-            },
-            style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.teal, minimumSize: const Size(200, 45)),
-            child: Text("Pay", style: GoogleFonts.poppins()),
-          ),
-
-          if (inlineMessage.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: Text(
-                inlineMessage,
-                style: TextStyle(
-                    color: inlineMessageSuccess ? Colors.green : Colors.red),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  // CREDIT UI
-  Widget _creditUI(int finalTotal) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: _box(),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text("Credit Payment",
-              style: GoogleFonts.poppins(
-                  fontSize: 18, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 10),
-
-          Text("Select Customer (Pending UI)",
-              style: GoogleFonts.poppins(color: Colors.grey)),
-
-          const SizedBox(height: 20),
-        ],
-      ),
-    );
-  }
-
+  // ---------------- BOX STYLE --------------------
   BoxDecoration _box() {
     return BoxDecoration(
       color: Colors.white,
       borderRadius: BorderRadius.circular(12),
       boxShadow: [
-        BoxShadow(color: Colors.black12, blurRadius: 6, offset: const Offset(0, 3)),
+        BoxShadow(
+          color: Colors.black12,
+          blurRadius: 6,
+          offset: const Offset(0, 3),
+        ),
       ],
     );
   }
