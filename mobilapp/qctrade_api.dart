@@ -386,28 +386,31 @@ class ReservationApi {
   }
 
   // ------------------ AVAILABLE TABLES --------------------
-  static Future<List> getAvailableTables(String date, String time) async {
-    final url =
-        "${QcTradeApi.baseUrl}/tables/available?reservation_date=$date&reservation_time=$time";
+  static Future<List> getAvailableTables(
+    String date, String time, int partySize) async {
 
-    final response = await http.get(
-  Uri.parse(url),
-  headers: QcTradeApi.headers(),
-);
+  final url =
+      "${QcTradeApi.baseUrl}/reservations/available-tables"
+      "?reservation_date=$date"
+      "&reservation_time=$time"
+      "&party_size=$partySize";
 
-    try {
-      final res = jsonDecode(response.body);
+  final response = await http.get(
+    Uri.parse(url),
+    headers: QcTradeApi.headers(),
+  );
 
-      if (res is List) return res;
-      if (res is Map && res.containsKey("data")) return res["data"];
+  try {
+    final res = jsonDecode(response.body);
 
-      return [];
-    } catch (e) {
-      print("❌ AVAILABLE TABLE PARSE ERROR:");
-      print(response.body);
-      return [];
-    }
+    if (res is List) return res;
+    if (res is Map && res.containsKey("data")) return res["data"];
+    return [];
+  } catch (e) {
+    print("PARSE ERROR => ${response.body}");
+    return [];
   }
+}
 
   // ------------------ CREATE RESERVATION ------------------
   static Future<Map<String, dynamic>> createReservation(Map data) async {
