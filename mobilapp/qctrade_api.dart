@@ -8,10 +8,10 @@ class QcTradeApi {
 
   // ===================== AUTH DETAILS =========================
   static String accessToken =
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbjFAZ21haWwuY29tIiwidGVuYW50X2lkIjoiN2IxNzdkOWMtZGJlZC00ZTUwLWE0ZGMtN2EyY2RkOWQ2ZTNmIiwiZXhwIjoxNzYzNTM3Mzc2fQ.Dl6lqzb4L5FCpZLQa5KVnRoBO-ST7dWAzgGxBhvMtus";
-
-  static String userId = "1";
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbjFAZ21haWwuY29tIiwidGVuYW50X2lkIjoiN2IxNzdkOWMtZGJlZC00ZTUwLWE0ZGMtN2EyY2RkOWQ2ZTNmIiwiZXhwIjoxNzYzODkxODk5fQ.CTZA6cf4yeceQBI7Jq5cwofqwXyn-HVdQPm6TO2EFnM"; 
+  static String userId = "1"; 
   static String tenantId = "7b177d9c-dbed-4e50-a4dc-7a2cdd9d6e3f";
+  static String branchId = "BR101";
 
   // ===================== COMMON HEADERS =======================
   static Map<String, String> headers() {
@@ -20,20 +20,22 @@ class QcTradeApi {
       "Authorization": "Bearer $accessToken",
       "X-User-Id": userId,
       "X-Tenant-Id": tenantId,
-      "X-Branch-Id": "BR101", // MANDATORY FIX
+      "X-Branch-Id": branchId,
     };
   }
 
   // ===================== SAFE JSON DECODER ====================
   static dynamic safeDecode(String body) {
-    try {
-      return jsonDecode(body);
-    } catch (e) {
-      print("❌ JSON DECODE ERROR: Backend returned HTML");
-      print(body);
-      return null;
-    }
+  try {
+    return jsonDecode(body);
+  } catch (e) {
+    print("JSON DECODE ERROR: Backend returned HTML");
+    print("----- BACKEND HTML START -----");
+    print(body);
+    print("----- BACKEND HTML END -----");
+    return null;
   }
+}
 
   // ===================== GENERIC GET ============================
   static Future<dynamic> get(String url) async {
@@ -92,34 +94,67 @@ class QcTradeApi {
 
   // ===================== LOGIN ===============================
   static Future<dynamic> login(String username, String password) async {
-    final url = "$baseUrl/auth/login";
+  final url = "$baseUrl/auth/login";
 
-    final res = await http.post(
-      Uri.parse(url),
-      headers: {"Content-Type": "application/json"},
-      body: jsonEncode({
-        "username": username,
-        "password": password,
-        "otp": "",
-      }),
-    );
+  final res = await http.post(
+    Uri.parse(url),
+    headers: {"Content-Type": "application/json"},
+    body: jsonEncode({
+      "username": username,
+      "password": password,
+      "otp": "",
+    }),
+  );
 
-    return safeDecode(res.body);
-  }
+  // IMPORTANT: PRINT THE FULL LOGIN RESPONSE
+  print(" LOGIN RESPONSE BODY => ${res.body}");
+
+  return safeDecode(res.body);
+}
 
   // ===================== ORDERS, PAYMENTS, CUSTOMERS (unchanged) =====================
   // (Keeping your original logic)
 
   static Future<dynamic> createOrder(Map<String, dynamic> data) async {
-    final url = "$baseUrl/orders";
-    final res = await post(url, data);
-    return res;
+  final url = "$baseUrl/orders/";
+  print("CREATE ORDER CALL => $url");
+  print("PAYLOAD => $data");
+
+  final res = await http.post(Uri.parse(url),
+      headers: headers(), body: jsonEncode(data));
+
+  print("STATUS CODE => ${res.statusCode}");
+  print("RESPONSE BODY => ${res.body}");
+
+  return safeDecode(res.body);
+}
+
+  // ===================== ADD ITEMS TO AN ORDER =====================
+static Future<dynamic> addItems(int orderId, List<Map<String, dynamic>> items) async {
+  final url = "$baseUrl/orders/$orderId/add-items";
+
+  final body = {
+    "items": items,
+  };
+
+  final res = await post(url, body);
+  return res;
+}
+
+  static Future<dynamic> validateTakeaway(int orderId) async {
+  final url = "$baseUrl/orders/$orderId/validate-takeaway-payment-first";
+
+  print(" VALIDATE URL => $url");
+
+  final res = await get(url);
+
+  if (res == null) {
+    print(" VALIDATION FAILED: Backend returned null");
+    return null;
   }
 
-  static Future<bool> validateTakeawayPaymentFirst(int orderId) async {
-  final url = "$baseUrl/orders/$orderId/validate-takeaway-payment-first";
-  final res = await get(url);
-  return res != null;
+  print("VALIDATION RESPONSE => $res");
+  return res;   // Return full map, not just true/false
 }
 
   static Future<dynamic> cashPayment({
@@ -182,6 +217,81 @@ static Future<bool> creditPayment({
   return res != null && res["payment_completed"] == true;
 }
 
+// ---------------- REPORTS SUMMARY API ----------------
+static Future<Map<String, dynamic>> fetchSummary(String dateRange) async {
+  final String url =
+      "$baseUrl/reports/sales-summary?date_range=$dateRange";
+
+  final res = await http.get(
+    Uri.parse(url),
+    headers: headers(),
+  );
+
+  if (res.statusCode == 200) {
+    return jsonDecode(res.body);
+  } else {
+    print("SUMMARY ERROR => ${res.body}");
+    throw Exception("Failed to load summary");
+  }
+}
+
+// ============================================================
+//                  DINE-IN PAYMENT FLOW
+// ============================================================
+
+// ===================== GET ACTIVE ORDERS (CORRECT URL) =====================
+static Future<List<dynamic>> getActiveOrders() async {
+  final url = "$baseUrl/orders/active-with-sub-orders";
+
+  final res = await get(url);
+
+  if (res == null) return [];
+
+  // The backend returns:
+  // { "orders": [ ... ] }
+  if (res is Map && res.containsKey("orders")) {
+    return res["orders"];
+  }
+
+  return [];
+}
+
+//  Get full details of a selected table/order
+static Future<dynamic> getOrderDetails(int orderId) async {
+  return await get("$baseUrl/orders/$orderId");
+}
+
+//  Send order to kitchen (after placing order)
+static Future<bool> sendToKitchen(int orderId) async {
+  final res = await post("$baseUrl/orders/$orderId/send-to-kitchen", {});
+  return res != null;
+}
+
+// Kitchen in progress
+static Future<bool> kitchenInProgress(int orderId) async {
+  final res =
+      await post("$baseUrl/orders/$orderId/kitchen-in-progress", {});
+  return res != null;
+}
+
+//  Preparing
+static Future<bool> preparing(int orderId) async {
+  final res = await post("$baseUrl/orders/$orderId/preparing", {});
+  return res != null;
+}
+
+// Order ready — move to payment page
+static Future<bool> readyToPay(int orderId) async {
+  final res = await post("$baseUrl/orders/$orderId/ready-to-pay", {});
+  return res != null;
+}
+
+// Complete order after payment
+static Future<bool> completeOrder(int orderId) async {
+  final res = await post("$baseUrl/orders/$orderId/completed", {});
+  return res != null;
+}
+
   static Future<List<dynamic>> getCustomers() async {
     final res = await get("$baseUrl/customers");
 
@@ -199,7 +309,7 @@ static Future<bool> creditPayment({
   final res = await post(url, data);
 
   if (res == null) {
-    print("❌ BACKEND RETURNED NULL (HTML or error)");
+    print(" BACKEND RETURNED NULL (HTML or error)");
     return {};
   }
 
@@ -210,6 +320,37 @@ static Future<bool> creditPayment({
   }
 
   return {};
+}
+// ============================================================
+//                     REFUND / RETURN APIs
+// ============================================================
+
+// Validate Order for refund
+static Future<bool> validateOrder(String orderNumber) async {
+  final url = "$baseUrl/validate-order/$orderNumber";
+  final res = await get(url);
+  return res != null; // if 200 = true
+}
+
+// Get Order Details for refund
+static Future<Map<String, dynamic>> getRefundOrderDetails(String orderNumber) async {
+  final url = "$baseUrl/order-details/$orderNumber";
+
+  final res = await get(url);
+
+  if (res is Map<String, dynamic>) {
+    return res;
+  }
+  return {};
+}
+
+// Process Refund
+static Future<bool> processRefund(Map<String, dynamic> data) async {
+  final url = "$baseUrl/process-refund";
+
+  final res = await post(url, data);
+
+  return res != null;  // success when backend returns JSON
 }
 }
 
@@ -250,15 +391,9 @@ class ReservationApi {
         "${QcTradeApi.baseUrl}/tables/available?reservation_date=$date&reservation_time=$time";
 
     final response = await http.get(
-      Uri.parse(url),
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer ${QcTradeApi.accessToken}",
-        "X-User-Id": QcTradeApi.userId,
-        "X-Tenant-Id": QcTradeApi.tenantId,
-        "X-Branch-Id": "BR101",
-      },
-    );
+  Uri.parse(url),
+  headers: QcTradeApi.headers(),
+);
 
     try {
       final res = jsonDecode(response.body);
@@ -292,5 +427,66 @@ class ReservationApi {
   // ------------------ DELETE RESERVATION ------------------
   static Future<bool> deleteReservation(String id) async {
     return await QcTradeApi.delete("$base/$id");
+  }
+}
+
+// =======================================================
+//                    SETTINGS API (CORRECT)
+// =======================================================
+class SettingsApi {
+  // ---------------------- GET GENERAL SETTINGS ----------------------
+  static Future<Map<String, dynamic>> getGeneralSettings() async {
+    final url = "${QcTradeApi.baseUrl}/proxy/qctrade/settings?key=general";
+    final res = await QcTradeApi.get(url);
+
+    if (res is Map && res.containsKey("data")) {
+      return res["data"]["value"] ?? {};
+    }
+    return {};
+  }
+
+  // ---------------------- SAVE GENERAL SETTINGS ----------------------
+  static Future<bool> saveGeneralSettings(Map value) async {
+    final url = "${QcTradeApi.baseUrl}/proxy/qctrade/settings";
+
+    final body = {"key": "general", "value": value};
+    final res = await QcTradeApi.put(url, body);
+    return res != null;
+  }
+
+  // ---------------------- GET BRANCHES -------------------------
+  static Future<List<dynamic>> getBranches() async {
+    final url = "${QcTradeApi.baseUrl}/branches";
+    final res = await QcTradeApi.get(url);
+
+    if (res is List) return res;
+    if (res is Map && res.containsKey("data")) return res["data"];
+    return [];
+  }
+
+  // ---------------------- GET ACTIVE BRANCH ---------------------
+  static Future<Map<String, dynamic>> getActiveBranch() async {
+    final url =
+        "${QcTradeApi.baseUrl}/proxy/qctrade/settings?key=branch";
+
+    final res = await QcTradeApi.get(url);
+
+    if (res is Map && res.containsKey("value")) {
+      return res["value"] ?? {};
+    }
+    return {};
+  }
+
+  // ---------------------- SAVE ACTIVE BRANCH ---------------------
+  static Future<bool> saveActiveBranch(Map<String, dynamic> value) async {
+    final url = "${QcTradeApi.baseUrl}/proxy/qctrade/settings";
+
+    final body = {
+      "key": "branch",
+      "value": value,
+    };
+
+    final res = await QcTradeApi.put(url, body);
+    return res != null;
   }
 }
