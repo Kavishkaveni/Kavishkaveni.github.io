@@ -22,15 +22,24 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
   final Color accentBlue = const Color(0xFF1E88E5);
   final Color tagBlue = const Color(0xFF64B5F6);
 
+  int toInt(dynamic value) {
+    if (value == null) return 0;
+    if (value is int) return value;
+    if (value is double) return value.toInt();
+    if (value is String) return int.tryParse(value) ?? 0;
+    return 0;
+  }
+
   @override
   void initState() {
     super.initState();
 
     orders = [
       {
-        "table": widget.orderData["table_id"] ??
-            widget.orderData["table_number"] ??
-            0,
+        "table": widget.orderData["table_number"] ??
+         widget.orderData["table_info"]?["table_number"] ??
+         widget.orderData["table_id"] ??
+         0,
         "orderNo": widget.orderData["id"] ?? 1,
         "customer": widget.orderData["customer"] ??
             widget.orderData["customer_name"] ??
@@ -42,15 +51,15 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
                 it["name"] ??
                 it["product"] ??
                 "Unknown Item",
-            "quantity": it["quantity"] ?? it["qty"] ?? 1,
-            "unit_price": it["unit_price"] ?? it["price"] ?? 0,
+            "quantity": toInt(it["quantity"] ?? it["qty"]),
+            "unit_price": toInt(it["unit_price"] ?? it["price"]),
           };
         }).toList(),
-        "subtotal":
-            widget.orderData["subtotal"] ?? widget.orderData["total_amount"],
-        "tax": widget.orderData["tax"] ?? 0,
-        "total":
-            widget.orderData["total"] ?? widget.orderData["total_amount"],
+        "subtotal": toInt(widget.orderData["subtotal"] ??
+            widget.orderData["total_amount"]),
+        "tax": toInt(widget.orderData["tax"] ?? 0),
+        "total": toInt(
+            widget.orderData["total"] ?? widget.orderData["total_amount"]),
         "date": DateTime.now().toString(),
       }
     ];
@@ -79,7 +88,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // MOBILE VIEW SAFE — Scroll Enabled
   Widget _mobileView() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(18),
@@ -87,7 +95,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // DESKTOP VIEW SAFE — Right Side Scroll Enabled
   Widget _desktopView() {
     return Row(
       children: [
@@ -102,7 +109,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // LEFT SIDE ORDER LIST
   Widget _leftSideOrderList() {
     return Container(
       width: 300,
@@ -184,7 +190,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // RIGHT SIDE ORDER DETAILS (scroll safe)
   Widget _orderDetailsView(Map order) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -218,7 +223,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // PROGRESS CARD — MOBILE Horizontal scroll FIXED
   Widget _orderProgressCard(String status) {
     return _card(
       child: Column(
@@ -271,7 +275,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // ORDER ITEMS
   Widget _orderItemsCard(List items) {
     return _card(
       child: Column(
@@ -286,8 +289,8 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
           Column(
             children: items.map((item) {
               final name = item["product_name"] ?? "Item";
-              final qty = item["quantity"] ?? 1;
-              final price = item["unit_price"] ?? 0;
+              final qty = toInt(item["quantity"]);
+              final price = toInt(item["unit_price"]);
 
               return Container(
                 padding: const EdgeInsets.symmetric(vertical: 10),
@@ -312,7 +315,6 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  // PAYMENT SUMMARY
   Widget _paymentSummaryCard(int subtotal, int tax, int total) {
     return _card(
       child: Column(
