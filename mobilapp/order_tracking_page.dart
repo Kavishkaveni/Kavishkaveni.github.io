@@ -1,5 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+
+import '../services/qctrade_api.dart';
 
 class OrderTrackingPage extends StatefulWidget {
   final Map<String, dynamic> orderData;
@@ -16,6 +20,7 @@ class OrderTrackingPage extends StatefulWidget {
 class _OrderTrackingPageState extends State<OrderTrackingPage> {
   int? selectedOrderIndex;
   late List<Map<String, dynamic>> orders;
+  Timer? timer;
 
   final Color primaryBlue = const Color(0xFF1565C0);
   final Color lightBlue = const Color(0xFFE3F2FD);
@@ -34,38 +39,70 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
   void initState() {
     super.initState();
 
-    orders = [
-      {
-        "table": widget.orderData["table_number"] ??
-         widget.orderData["table_info"]?["table_number"] ??
-         widget.orderData["table_id"] ??
-         0,
-        "orderNo": widget.orderData["id"] ?? 1,
-        "customer": widget.orderData["customer"] ??
-            widget.orderData["customer_name"] ??
-            "Walk-in Customer",
-        "status": widget.orderData["status"] ?? "pending",
-        "items": (widget.orderData["items"] ?? []).map((it) {
-          return {
-            "product_name": it["product_name"] ??
-                it["name"] ??
-                it["product"] ??
-                "Unknown Item",
-            "quantity": toInt(it["quantity"] ?? it["qty"]),
-            "unit_price": toInt(it["unit_price"] ?? it["price"]),
-          };
-        }).toList(),
-        "subtotal": toInt(widget.orderData["subtotal"] ??
-            widget.orderData["total_amount"]),
-        "tax": toInt(widget.orderData["tax"] ?? 0),
-        "total": toInt(
-            widget.orderData["total"] ?? widget.orderData["total_amount"]),
-        "date": DateTime.now().toString(),
-      }
-    ];
+    //Initial UI
+    orders = [_mapOrder(widget.orderData)];
 
     selectedOrderIndex = 0;
+
+    //Auto refresh every 3 seconds
+    timer = Timer.periodic(const Duration(seconds: 3), (_) {
+      _refreshOrder();
+    });
+
+    // Load backend one time immediately
+    _refreshOrder();
   }
+
+  // -----------------------------------------------------
+  // BACKEND MAPPER
+  // -----------------------------------------------------
+  Map<String, dynamic> _mapOrder(dynamic o) {
+    return {
+      "table": o["table_number"] ??
+          o["table_info"]?["table_number"] ??
+          o["table_id"] ??
+          0,
+      "orderNo": o["id"],
+      "customer": o["customer_name"] ?? "Walk-in Customer",
+      "status": o["status"] ?? "pending",
+      "items": (o["items"] ?? []).map((it) {
+        return {
+          "product_name": it["product_name"],
+          "quantity": toInt(it["quantity"]),
+          "unit_price": toInt(it["unit_price"]),
+        };
+      }).toList(),
+      "subtotal": toInt(o["subtotal"] ?? o["total_amount"]),
+      "tax": toInt(o["tax"] ?? 0),
+      "total": toInt(o["total"] ?? o["total_amount"]),
+      "date": DateTime.now().toString(),
+    };
+  }
+
+  // -----------------------------------------------------
+  // AUTO REFRESH API CALL
+  // -----------------------------------------------------
+  Future<void> _refreshOrder() async {
+    final id = widget.orderData["id"];
+
+    final updated = await QcTradeApi.getOrderDetails(id);
+
+    if (updated == null) return;
+
+    setState(() {
+      orders[0] = _mapOrder(updated);
+    });
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    super.dispose();
+  }
+
+  // -----------------------------------------------------
+  // UI
+  // -----------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
@@ -240,10 +277,14 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
               children: [
                 _progressStep("Pending", Icons.inventory_2,
                     status == "pending"),
-                _progressStep("Kitchen", Icons.cookie, false),
-                _progressStep("Preparing", Icons.restaurant, false),
-                _progressStep("Pay", Icons.attach_money, false),
-                _progressStep("Completed", Icons.verified, false),
+                _progressStep("Kitchen", Icons.cookie,
+                    status == "kitchen_in_progress"),
+                _progressStep("Preparing", Icons.restaurant,
+                    status == "preparing"),
+                _progressStep("Pay", Icons.attach_money,
+                    status == "ready_to_pay"),
+                _progressStep("Completed", Icons.verified,
+                    status == "completed"),
               ],
             ),
           ),
