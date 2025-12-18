@@ -411,24 +411,33 @@ Widget _buildAddFormUI() {
             onChanged: (v) {
   if (v == null) return;
 
-  final stock = stocks.firstWhere(
-    (e) => e['id'].toString() == v.toString(),
-  );
+  onChanged: (v) async {
+  if (v == null) return;
 
   setState(() {
     stockId = v;
-
-    // ✅ EXISTS — WILL SHOW NOW
-    productName = stock['product_name']?.toString();
-
-    // ❌ DOES NOT COME FROM STOCK API
-    supplierName = null;
-
-    // ✅ CORRECT KEY (YOU CONFIRMED)
-    sourceLocation = stock['stock_location']?.toString();
   });
 
-  // 🔍 DEBUG (VERY IMPORTANT)
+  try {
+    final details =
+        await ApiService.getStockDetailsForMovement(v);
+
+    setState(() {
+      productName = details['product_name']?.toString();
+      supplierName = details['supplier_name']?.toString();
+      sourceLocation = details['source_location']?.toString();
+    });
+
+    debugPrint("AUTO PRODUCT: $productName");
+    debugPrint("AUTO SUPPLIER: $supplierName");
+    debugPrint("AUTO LOCATION: $sourceLocation");
+
+  } catch (e) {
+    debugPrint("AUTO-FILL ERROR: $e");
+  }
+},
+
+  // DEBUG (VERY IMPORTANT)
   debugPrint("AUTO PRODUCT: $productName");
   debugPrint("AUTO LOCATION: $sourceLocation");
 },
@@ -583,15 +592,14 @@ Widget _buildAddFormUI() {
   }
 
   Widget _readOnlyBox(String label, String? value) {
-    return TextFormField(
-      readOnly: true,
-      initialValue: _na(value),
-      decoration: InputDecoration(
-        labelText: label,
-        border: const OutlineInputBorder(),
-      ),
-    );
-  }
+  return InputDecorator(
+    decoration: InputDecoration(
+      labelText: label,
+      border: const OutlineInputBorder(),
+    ),
+    child: Text(_na(value)),
+  );
+}
 
   Widget _textField({
     required String label,
