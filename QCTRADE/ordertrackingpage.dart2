@@ -35,6 +35,14 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     return 0;
   }
 
+  double toDouble(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is double) return value;
+    if (value is int) return value.toDouble();
+    if (value is String) return double.tryParse(value) ?? 0.0;
+    return 0.0;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -55,33 +63,118 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
   // STATUS NORMALIZATION (BACKEND → UI)
   // -----------------------------------------------------
   String normalizeStatus(String raw) {
-    switch (raw) {
+    final s = (raw).toString().toLowerCase().trim();
+
+    switch (s) {
       case "pending":
         return "pending";
-      case "kitchen_in_progress":
+
+      case "kitchen":
+      case "sent_to_kitchen":
+      case "awaiting_kitchen":
       case "payment_completed_awaiting_kitchen":
+      case "payment_completed":
+      case "kitchen_in_progress":
         return "kitchen_in_progress";
+
       case "preparing":
+      case "in_preparing":
         return "preparing";
+
       case "pay":
       case "ready_to_pay":
+      case "ready_for_payment":
         return "ready_to_pay";
+
+      case "served":
       case "completed":
+      case "done":
         return "completed";
+
       default:
         return "pending";
     }
   }
 
   // -----------------------------------------------------
+  // STATUS LABEL (BACKEND → UI TAG TEXT)
+  // -----------------------------------------------------
+  String prettyStatus(dynamic raw) {
+    final s = (raw ?? "").toString();
+    if (s.isEmpty) return "pending";
+
+    // snake_case -> words
+    final parts = s.split('_').where((p) => p.trim().isNotEmpty).toList();
+    final titled = parts
+        .map((p) => p.substring(0, 1).toUpperCase() + p.substring(1))
+        .join(' ');
+
+    return titled.isEmpty ? s : titled;
+  }
+
+  // -----------------------------------------------------
+  // PAYMENT STATUS DETECTION
+  // -----------------------------------------------------
+  bool isPaidFromBackend(dynamic o) {
+    final isPaidFlag = o["is_paid"] == true;
+
+    final paymentStatus = (o["payment_status"] ?? o["paymentStatus"] ?? "")
+        .toString()
+        .toLowerCase()
+        .trim();
+
+    final status = (o["status"] ?? "").toString().toLowerCase().trim();
+
+    // accept multiple possible backend values
+    final orderType =
+    (o["order_type"] ?? "").toString().toLowerCase();
+
+if (isPaidFlag) return true;
+
+if (paymentStatus == "paid" ||
+    paymentStatus == "completed") {
+  return true;
+}
+
+// React treats these as PAID
+if (status == "payment_completed" ||
+    status == "payment_completed_awaiting_kitchen") {
+  return true;
+}
+
+// TAKEAWAY & MOBILE
+// In WebUI, when status = pay, payment is already done
+if ((orderType == "takeaway" || orderType == "mobile") &&
+    status == "pay") {
+  return true;
+}
+
+return false;
+  }
+
+  // -----------------------------------------------------
+  // SUM ITEMS SUBTOTAL (SAFE)
+  // -----------------------------------------------------
+  int calcSubtotalFromItems(List<Map<String, dynamic>> items) {
+    double sum = 0;
+    for (final it in items) {
+      final qty = toDouble(it["quantity"]);
+      final price = toDouble(it["unit_price"]);
+      sum += qty * price;
+    }
+    return sum.round();
+  }
+
+  // -----------------------------------------------------
   // BACKEND MAPPER
   // -----------------------------------------------------
   Map<String, dynamic> _mapOrder(dynamic o) {
-    final rawStatus = o["status"] ?? "pending";
+    final rawStatus = (o["status"] ?? "pending").toString();
     final normalizedStatus = normalizeStatus(rawStatus);
 
     final items = <Map<String, dynamic>>[];
 
+    // main order items
     if (o["items"] is List) {
       for (final it in o["items"]) {
         items.add({
@@ -92,6 +185,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
       }
     }
 
+    // sub order items (if exist)
     if (o["sub_orders"] is List) {
       for (final so in o["sub_orders"]) {
         if (so["items"] is List) {
@@ -106,8 +200,42 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
       }
     }
 
-    final bool isPaid =
-        o["is_paid"] == true || o["payment_status"] == "completed";
+    final bool isPaid = isPaidFromBackend(o);
+
+    // totals from backend
+    final backendTotal = toInt(o["total"] ?? o["total_amount"]);
+    final backendSubtotal = toInt(o["subtotal"]);
+    final backendTax = toInt(o["tax"]);
+
+    // calculate subtotal if missing
+    final computedSubtotal = calcSubtotalFromItems(items);
+    int subtotal = backendSubtotal > 0 ? backendSubtotal : computedSubtotal;
+
+    // if backend total missing, compute total
+    int total = backendTotal > 0 ? backendTotal : subtotal;
+
+    // tax handling:
+    // - if backend gives tax, use it
+    // - else compute 10% tax from subtotal ONLY if total looks like subtotal + tax
+    //   (otherwise keep 0 to avoid double-taxing when backend total already includes tax)
+    int tax = 0;
+    if (backendTax > 0) {
+      tax = backendTax;
+    } else {
+      final expectedTax = (subtotal * 0.10).round();
+      final expectedTotal = subtotal + expectedTax;
+      if (total == expectedTotal) {
+        tax = expectedTax;
+      } else {
+        tax = 0;
+      }
+    }
+
+    // If total equals subtotal but we computed tax > 0 incorrectly, keep consistent
+    // (This avoids showing tax row as non-zero when total doesn't include it.)
+    if (total == subtotal) {
+      tax = 0;
+    }
 
     return {
       "table": o["table_number"] ??
@@ -118,10 +246,11 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
       "customer": o["customer_name"] ?? "Walk-in Customer",
       "status": normalizedStatus,
       "raw_status": rawStatus,
+      "raw_status_label": prettyStatus(rawStatus),
       "items": items,
-      "subtotal": toInt(o["subtotal"] ?? o["total_amount"]),
-      "tax": toInt(o["tax"] ?? 0),
-      "total": toInt(o["total"] ?? o["total_amount"]),
+      "subtotal": subtotal,
+      "tax": tax,
+      "total": total,
       "payment_status": isPaid ? "Payment Completed" : "Payment Pending",
       "date": o["created_at"]?.toString() ?? DateTime.now().toString(),
     };
@@ -131,20 +260,25 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
   // AUTO REFRESH API CALL (CORRECT API)
   // -----------------------------------------------------
   Future<void> _refreshOrder() async {
-    final updated =
-        await QcTradeApi.getOrderWithSubOrders(widget.orderId);
+    try {
+      final updated = await QcTradeApi.getOrderWithSubOrders(widget.orderId);
 
-    if (updated == null) return;
+      if (!mounted) return;
+      if (updated == null) return;
 
-    final mapped = _mapOrder(updated);
+      final mapped = _mapOrder(updated);
 
-    setState(() {
-      if (orders.isEmpty) {
-        orders.add(mapped);
-      } else {
-        orders[0] = mapped;
-      }
-    });
+      setState(() {
+        if (orders.isEmpty) {
+          orders.add(mapped);
+        } else {
+          orders[0] = mapped;
+        }
+      });
+    } catch (e) {
+      // keep silent UI (no UI changes), just stop crash
+      debugPrint("ORDER REFRESH ERROR: $e");
+    }
   }
 
   @override
@@ -246,7 +380,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      _statusTag(ord["raw_status"]),
+                      _statusTag(ord["raw_status_label"]),
                       Text(
                         "Rs ${ord["subtotal"]}",
                         style: GoogleFonts.poppins(
@@ -299,13 +433,10 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
         Text(order["date"],
             style: GoogleFonts.poppins(fontSize: 12, color: Colors.grey)),
         const SizedBox(height: 14),
-
         _orderProgressCard(order["status"]),
         const SizedBox(height: 18),
-
         _orderItemsCard(order["items"]),
         const SizedBox(height: 18),
-
         _paymentSummaryCard(
           order["subtotal"],
           order["tax"],
@@ -331,16 +462,15 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
-                _progressStep("Pending", Icons.inventory_2,
-                    status == "pending"),
+                _progressStep("Pending", Icons.inventory_2, status == "pending"),
                 _progressStep("Kitchen", Icons.cookie,
                     status == "kitchen_in_progress"),
-                _progressStep("Preparing", Icons.restaurant,
-                    status == "preparing"),
-                _progressStep("Pay", Icons.attach_money,
-                    status == "ready_to_pay"),
-                _progressStep("Completed", Icons.verified,
-                    status == "completed"),
+                _progressStep(
+                    "Preparing", Icons.restaurant, status == "preparing"),
+                _progressStep(
+                    "Pay", Icons.attach_money, status == "ready_to_pay"),
+                _progressStep(
+                    "Completed", Icons.verified, status == "completed"),
               ],
             ),
           ),
