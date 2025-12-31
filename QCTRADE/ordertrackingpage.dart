@@ -6,11 +6,11 @@ import 'package:google_fonts/google_fonts.dart';
 import '../services/qctrade_api.dart';
 
 class OrderTrackingPage extends StatefulWidget {
-  final Map<String, dynamic> orderData;
+  final int orderId;
 
   const OrderTrackingPage({
     super.key,
-    required this.orderData,
+    required this.orderId,
   });
 
   @override
@@ -35,63 +35,186 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     return 0;
   }
 
+  double toDouble(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is double) return value;
+    if (value is int) return value.toDouble();
+    if (value is String) return double.tryParse(value) ?? 0.0;
+    return 0.0;
+  }
+
+  // ================= PAYMENT STATUS =================
+
+  String resolvePaymentStatus(dynamic o) {
+    final paymentStatus =
+        (o["payment_status"] ?? "").toString().toLowerCase();
+    final status =
+        (o["status"] ?? "").toString().toLowerCase();
+
+    if (paymentStatus == "paid") return "Payment Completed";
+    if (status == "pay" || status.contains("ready"))
+      return "Payment Ready";
+
+    return "Payment Pending";
+  }
+
+  bool isPaidFromBackend(dynamic o) {
+    final paymentStatus =
+        (o["payment_status"] ?? "").toString().toLowerCase();
+    final status =
+        (o["status"] ?? "").toString().toLowerCase();
+
+    return paymentStatus == "paid" ||
+        status.contains("payment_completed");
+  }
+
+  // ================= STATUS =================
+
+  String normalizeStatus(dynamic o) {
+    final status = (o["status"] ?? "").toString().toLowerCase();
+
+    if (status == "completed") return "completed";
+    if (status.contains("kitchen")) return "kitchen_in_progress";
+    if (status.contains("preparing")) return "preparing";
+    if (status == "pay" || status.contains("ready"))
+      return "ready_to_pay";
+
+    return "pending";
+  }
+
+  String prettyStatus(dynamic raw) {
+    final s = (raw ?? "").toString();
+    if (s.isEmpty) return "Pending";
+
+    return s
+        .split('_')
+        .map((e) => e[0].toUpperCase() + e.substring(1))
+        .join(' ');
+  }
+
+  // ================= TOTALS =================
+
+  double calcSubtotalFromItems(List<Map<String, dynamic>> items) {
+  double sum = 0.0;
+  for (final it in items) {
+    sum += toDouble(it["quantity"]) * toDouble(it["unit_price"]);
+  }
+  return sum;
+}
+
+  // ================= MAP ORDER =================
+
+  Map<String, dynamic> _mapOrder(dynamic o) {
+    final items = <Map<String, dynamic>>[];
+    final List<Map<String, dynamic>> subOrderItems = [];
+double subOrderTotal = 0.0;
+
+    if (o["items"] is List) {
+      for (final it in o["items"]) {
+        items.add({
+          "product_name": it["product_name"],
+          "quantity": toInt(it["quantity"]),
+          "unit_price": toInt(it["unit_price"]),
+        });
+      }
+    }
+
+    if (o["sub_orders"] is List) {
+  for (final sub in o["sub_orders"]) {
+    if (sub["items"] is List) {
+      for (final it in sub["items"]) {
+        final qty = toInt(it["quantity"]);
+        final price = toDouble(it["unit_price"]);
+
+        subOrderItems.add({
+          "product_name": it["product_name"],
+          "quantity": qty,
+          "unit_price": price,
+        });
+
+        subOrderTotal += qty * price;
+      }
+    }
+  }
+}
+
+    final double mainSubtotal = calcSubtotalFromItems(items);
+final double combinedSubtotal =
+    toDouble(o["combined_total"] ?? (mainSubtotal + subOrderTotal));
+
+final double tax =
+    double.parse((combinedSubtotal * 0.10).toStringAsFixed(2));
+
+final double total =
+    double.parse((combinedSubtotal + tax).toStringAsFixed(2));
+
+    final tableValue =
+        o["table_info"]?["number"] ?? o["table_number"];
+
+    return {
+      "showTable": tableValue != null,
+      "table": tableValue,
+      "orderNo": o["id"],
+      "customer": o["customer_name"] ?? "Walk-in Customer",
+      "status": normalizeStatus(o),
+      "raw_status": o["status"],
+      "raw_status_label": prettyStatus(o["status"]),
+      "items": items,
+      "sub_items": subOrderItems,
+"main_subtotal": mainSubtotal,
+"sub_total": subOrderTotal,
+"combined_subtotal": combinedSubtotal,
+      "tax": tax,
+      "total": total,
+      "payment_status": resolvePaymentStatus(o),
+      "date": o["created_at"],
+    };
+  }
+
+  // ================= API REFRESH =================
+
   @override
   void initState() {
     super.initState();
 
-    //Initial UI
-    orders = [_mapOrder(widget.orderData)];
-
+    orders = [];
     selectedOrderIndex = 0;
 
-    //Auto refresh every 3 seconds
     timer = Timer.periodic(const Duration(seconds: 3), (_) {
       _refreshOrder();
     });
 
-    // Load backend one time immediately
     _refreshOrder();
   }
 
-  // -----------------------------------------------------
-  // BACKEND MAPPER
-  // -----------------------------------------------------
-  Map<String, dynamic> _mapOrder(dynamic o) {
-    return {
-      "table": o["table_number"] ??
-          o["table_info"]?["table_number"] ??
-          o["table_id"] ??
-          0,
-      "orderNo": o["id"],
-      "customer": o["customer_name"] ?? "Walk-in Customer",
-      "status": o["status"] ?? "pending",
-      "items": (o["items"] ?? []).map((it) {
-        return {
-          "product_name": it["product_name"],
-          "quantity": toInt(it["quantity"]),
-          "unit_price": toInt(it["unit_price"]),
-        };
-      }).toList(),
-      "subtotal": toInt(o["subtotal"] ?? o["total_amount"]),
-      "tax": toInt(o["tax"] ?? 0),
-      "total": toInt(o["total"] ?? o["total_amount"]),
-      "date": DateTime.now().toString(),
-    };
-  }
-
-  // -----------------------------------------------------
-  // AUTO REFRESH API CALL
-  // -----------------------------------------------------
   Future<void> _refreshOrder() async {
-    final id = widget.orderData["id"];
+    try {
+      final res = await QcTradeApi.getActiveOrders(
+        page: 1,
+        limit: 20,
+        status: "all",
+      );
 
-    final updated = await QcTradeApi.getOrderDetails(id);
+      if (res == null || res["orders"] == null) return;
 
-    if (updated == null) return;
+      final found = (res["orders"] as List)
+          .firstWhere((e) => e["id"] == widget.orderId,
+              orElse: () => null);
 
-    setState(() {
-      orders[0] = _mapOrder(updated);
-    });
+      if (found == null) return;
+
+      final mapped = _mapOrder(found);
+
+      setState(() {
+        if (orders.isEmpty) {
+          orders.add(mapped);
+        } else {
+          orders[0] = mapped;
+        }
+      });
+    } catch (e) {
+      debugPrint("ORDER REFRESH ERROR: $e");
+    }
   }
 
   @override
@@ -100,9 +223,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     super.dispose();
   }
 
-  // -----------------------------------------------------
-  // UI
-  // -----------------------------------------------------
+  // ================= UI (UNCHANGED) =================
 
   @override
   Widget build(BuildContext context) {
@@ -121,14 +242,16 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
           ),
         ),
       ),
-      body: isMobile ? _mobileView() : _desktopView(),
+      body: orders.isEmpty
+          ? const Center(child: CircularProgressIndicator())
+          : (isMobile ? _mobileView() : _desktopView()),
     );
   }
 
   Widget _mobileView() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(18),
-      child: _orderDetailsView(orders[selectedOrderIndex!]),
+      child: _orderDetailsView(orders[0]),
     );
   }
 
@@ -139,7 +262,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
         Expanded(
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(18),
-            child: _orderDetailsView(orders[selectedOrderIndex!]),
+            child: _orderDetailsView(orders[0]),
           ),
         ),
       ],
@@ -174,7 +297,9 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    "Table ${ord["table"]} - #${ord["orderNo"]}",
+                    ord["showTable"] == true
+                        ? "Table ${ord["table"]} - #${ord["orderNo"]}"
+                        : "Order #${ord["orderNo"]}",
                     style: GoogleFonts.poppins(
                       fontWeight: FontWeight.w600,
                       fontSize: 13,
@@ -191,9 +316,9 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      _statusTag(ord["status"]!),
+                      _statusTag(ord["raw_status_label"]),
                       Text(
-                        "Rs ${ord["subtotal"]}",
+                        "Rs ${ord["subtotal"].toStringAsFixed(2)}",
                         style: GoogleFonts.poppins(
                           fontWeight: FontWeight.w600,
                         ),
@@ -232,7 +357,9 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          "Table ${order["table"]} - Order #${order["orderNo"]}",
+          order["showTable"] == true
+              ? "Table ${order["table"]} - Order #${order["orderNo"]}"
+              : "Order #${order["orderNo"]}",
           style: GoogleFonts.poppins(
             fontWeight: FontWeight.w700,
             fontSize: 19,
@@ -244,21 +371,131 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
         Text(order["date"],
             style: GoogleFonts.poppins(fontSize: 12, color: Colors.grey)),
         const SizedBox(height: 14),
-
         _orderProgressCard(order["status"]),
         const SizedBox(height: 18),
-
         _orderItemsCard(order["items"]),
+        if ((order["sub_items"] as List).isNotEmpty) ...[
+  const SizedBox(height: 18),
+  _subOrderItemsCard(order["sub_items"]),
+],
         const SizedBox(height: 18),
-
         _paymentSummaryCard(
-          order["subtotal"],
-          order["tax"],
-          order["total"],
-        ),
+  order["main_subtotal"],
+  order["sub_total"],
+  order["combined_subtotal"],
+  order["tax"],
+  order["total"],
+  order["payment_status"],
+),
+        if (order["payment_status"] != "Payment Completed")
+  _cancelOrderButton(order["orderNo"]),
       ],
     );
   }
+
+  Widget _subOrderItemsCard(List items) {
+  return _card(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          "Sub-Order Items",
+          style: GoogleFonts.poppins(
+            fontWeight: FontWeight.w600,
+            fontSize: 15,
+            color: primaryBlue,
+          ),
+        ),
+        const SizedBox(height: 12),
+        Column(
+          children: items.map((item) {
+            final qty = toInt(item["quantity"]);
+            final price = toDouble(item["unit_price"]);
+
+            return Container(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: const BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(color: Colors.grey, width: .2),
+                ),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text("${item["product_name"]} × $qty"),
+                  Text(
+                    "Rs ${(qty * price).toStringAsFixed(2)}",
+                    style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+            );
+          }).toList(),
+        ),
+      ],
+    ),
+  );
+}
+
+  // ================= REMAINING UI UNCHANGED =================
+
+  Widget _cancelOrderButton(int orderId) {
+  return Padding(
+    padding: const EdgeInsets.only(top: 16),
+    child: SizedBox(
+      width: double.infinity,
+      child: ElevatedButton(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.red.shade600,
+        ),
+        onPressed: () => _showCancelDialog(orderId),
+        child: const Text("Cancel Order"),
+      ),
+    ),
+  );
+}
+
+void _showCancelDialog(int orderId) {
+  final reasonController = TextEditingController();
+
+  showDialog(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: const Text("Cancel Order"),
+      content: TextField(
+        controller: reasonController,
+        decoration: const InputDecoration(
+          labelText: "Cancellation Reason *",
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text("Back"),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.red,
+          ),
+          onPressed: () async {
+            if (reasonController.text.trim().isEmpty) return;
+
+            await QcTradeApi.post(
+              "${QcTradeApi.baseUrl}/orders/$orderId/cancel",
+              {
+                "reason": reasonController.text.trim(),
+              },
+            );
+
+            Navigator.pop(context); // dialog
+            Navigator.pop(context); // order tracking page
+          },
+          child: const Text("Confirm Cancel"),
+        ),
+      ],
+    ),
+  );
+}
 
   Widget _orderProgressCard(String status) {
     return _card(
@@ -275,16 +512,15 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
-                _progressStep("Pending", Icons.inventory_2,
-                    status == "pending"),
+                _progressStep("Pending", Icons.inventory_2, status == "pending"),
                 _progressStep("Kitchen", Icons.cookie,
                     status == "kitchen_in_progress"),
-                _progressStep("Preparing", Icons.restaurant,
-                    status == "preparing"),
-                _progressStep("Pay", Icons.attach_money,
-                    status == "ready_to_pay"),
-                _progressStep("Completed", Icons.verified,
-                    status == "completed"),
+                _progressStep(
+                    "Preparing", Icons.restaurant, status == "preparing"),
+                _progressStep(
+                    "Pay", Icons.attach_money, status == "ready_to_pay"),
+                _progressStep(
+                    "Completed", Icons.verified, status == "completed"),
               ],
             ),
           ),
@@ -336,8 +572,8 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
               return Container(
                 padding: const EdgeInsets.symmetric(vertical: 10),
                 decoration: const BoxDecoration(
-                  border: Border(
-                      bottom: BorderSide(color: Colors.grey, width: .2)),
+                  border:
+                      Border(bottom: BorderSide(color: Colors.grey, width: .2)),
                 ),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -356,7 +592,14 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  Widget _paymentSummaryCard(int subtotal, int tax, int total) {
+  Widget _paymentSummaryCard(
+  double mainSubtotal,
+  double subTotal,
+  double combinedSubtotal,
+  double tax,
+  double total,
+  String paymentStatus,
+) {
     return _card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -370,10 +613,14 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
             ),
           ),
           const SizedBox(height: 10),
-          _summaryRow("Main Order Subtotal", subtotal),
-          _summaryRow("Tax (10%)", tax),
-          const Divider(),
-          _summaryRow("Total", total, isBold: true, isBlue: true),
+          _summaryRow("Main Order Subtotal", mainSubtotal),
+if (subTotal > 0)
+  _summaryRow("Sub-Order Total", subTotal),
+const Divider(),
+_summaryRow("Combined Subtotal", combinedSubtotal),
+_summaryRow("Tax (10%)", tax),
+const Divider(),
+_summaryRow("Total", total, isBold: true, isBlue: true),
           const SizedBox(height: 10),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -382,7 +629,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(
-              "Payment Pending",
+              paymentStatus,
               style: GoogleFonts.poppins(color: primaryBlue),
             ),
           ),
@@ -391,7 +638,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
     );
   }
 
-  Widget _summaryRow(String title, int amount,
+  Widget _summaryRow(String title, double amount,
       {bool isBold = false, bool isBlue = false}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -399,8 +646,7 @@ class _OrderTrackingPageState extends State<OrderTrackingPage> {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(title, style: GoogleFonts.poppins(fontSize: 12)),
-          Text(
-            "Rs $amount",
+          Text("Rs ${amount.toStringAsFixed(2)}",
             style: GoogleFonts.poppins(
               fontSize: 13,
               fontWeight: isBold ? FontWeight.bold : FontWeight.w500,
