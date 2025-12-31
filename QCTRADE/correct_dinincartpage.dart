@@ -7,7 +7,7 @@ import '../services/qctrade_api.dart';
 
 class DineInOrderCartPage extends StatefulWidget {
   final int tableId;
-  final int tableNumber;
+  final String tableNumber;
   final Map<String, int> cartItems;
 
   const DineInOrderCartPage({
@@ -40,6 +40,157 @@ final Map<String, int> existingItems = {};
 double existingOrderTotal = 0;
 int currentPage = 0;
 static const int itemsPerPage = 4;
+
+void _openCartDialog() {
+  showDialog(
+    context: context,
+    barrierDismissible: true,
+    builder: (_) {
+      return Dialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: StatefulBuilder(
+          builder: (context, setModalState) {
+            return Padding(
+              padding: const EdgeInsets.all(16),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 520),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      "Cart Items",
+                      style: GoogleFonts.poppins(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    Expanded(
+                      child: cart.isEmpty
+                          ? Center(
+                              child: Text(
+                                "No items",
+                                style: GoogleFonts.poppins(color: Colors.grey),
+                              ),
+                            )
+                          : ListView(
+                              children: cart.entries.map((e) {
+                                final item = menuItems.firstWhere(
+                                  (i) => i["name"] == e.key,
+                                );
+                                final price = item["price"];
+
+                                return Container(
+                                  padding: const EdgeInsets.all(12),
+                                  margin:
+                                      const EdgeInsets.only(bottom: 10),
+                                  decoration: BoxDecoration(
+                                    color: Colors.blue.shade50,
+                                    borderRadius:
+                                        BorderRadius.circular(10),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          e.key,
+                                          style: GoogleFonts.poppins(
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.remove_circle,
+                                            color: Colors.red),
+                                        onPressed: () {
+                                          setModalState(
+                                              () => decreaseItem(e.key));
+                                          setState(() {});
+                                        },
+                                      ),
+                                      Text(
+                                        "${e.value}",
+                                        style: GoogleFonts.poppins(
+                                            fontWeight: FontWeight.w600),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.add_circle,
+                                            color: Colors.green),
+                                        onPressed: () {
+                                          setModalState(
+                                              () => addToCart(e.key));
+                                          setState(() {});
+                                        },
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        "Rs ${price * e.value}",
+                                        style: GoogleFonts.poppins(
+                                            fontWeight: FontWeight.w600),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                    ),
+
+                    const SizedBox(height: 10),
+                    Text(
+                      hasExistingOrder
+                          ? "New: Rs $newItemsTotal   |   Grand: Rs $grandTotal"
+                          : "Total: Rs $grandTotal",
+                      style: GoogleFonts.poppins(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.grey.shade400,
+                            ),
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text("Close"),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor:
+                                  const Color(0xFF1E88E5),
+                            ),
+                            onPressed:
+                                cart.isEmpty ? null : submitOrder,
+                            child: Text(
+  "Send to Kitchen",
+  textAlign: TextAlign.center,
+  style: GoogleFonts.poppins(
+    fontWeight: FontWeight.w600,
+  ),
+),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    },
+  );
+}
 
 
   @override
@@ -334,16 +485,50 @@ setState(() {});
     return Scaffold(
       backgroundColor: const Color(0xFFF4F9FF),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1E88E5),
-        elevation: 0,
-        title: Text(
-          "Table ${widget.tableNumber} - Orders",
-          style: GoogleFonts.poppins(
-            color: Colors.white,
-            fontWeight: FontWeight.w600,
+  backgroundColor: const Color(0xFF1E88E5),
+  elevation: 0,
+  title: Text(
+    "Table ${widget.tableNumber} - Orders",
+    style: GoogleFonts.poppins(
+      color: Colors.white,
+      fontWeight: FontWeight.w600,
+    ),
+  ),
+  actions: [
+    Padding(
+      padding: const EdgeInsets.only(right: 10),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          IconButton(
+            icon: const Icon(Icons.shopping_cart, color: Colors.white),
+            onPressed: cart.isEmpty ? null : _openCartDialog,
           ),
-        ),
+          if (cart.isNotEmpty)
+            Positioned(
+              right: 6,
+              top: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  "${cart.values.fold<int>(0, (a, b) => a + b)}",
+                  style: GoogleFonts.poppins(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
+    ),
+  ],
+),
       body: isLoading
           ? const Center(child: CircularProgressIndicator())
           : (isMobile ? _mobileLayout() : _desktopLayout()),
@@ -363,7 +548,6 @@ setState(() {});
     return Column(
       children: [
         Expanded(child: _rightMenuSection()),
-        _bottomCartButton(),
       ],
     );
   }
@@ -666,31 +850,47 @@ if (pages.length > 1)
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(
-  child: ClipRRect(
-    borderRadius: BorderRadius.circular(10),
-    child: item["image"] != null && item["image"].toString().isNotEmpty
-        ? CachedNetworkImage(
-            imageUrl: item["image"],
-            fit: BoxFit.cover,
-            width: double.infinity,
-            placeholder: (_, __) => Container(
-              color: Colors.blue.shade50,
-              alignment: Alignment.center,
-              child: const CircularProgressIndicator(strokeWidth: 2),
+  child: Stack(
+    children: [
+      ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: item["image"] != null && item["image"].toString().isNotEmpty
+            ? CachedNetworkImage(
+                imageUrl: item["image"],
+                fit: BoxFit.cover,
+                width: double.infinity,
+              )
+            : Container(
+                color: Colors.blue.shade50,
+                alignment: Alignment.center,
+                child: const Icon(Icons.fastfood,
+                    color: Colors.blue, size: 30),
+              ),
+      ),
+
+      // QUANTITY BADGE (TOP RIGHT)
+      if (cart[item["name"]] != null)
+        Positioned(
+          top: 6,
+          right: 6,
+          child: Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1E88E5),
+              borderRadius: BorderRadius.circular(10),
             ),
-            errorWidget: (_, __, ___) => Container(
-              color: Colors.blue.shade50,
-              alignment: Alignment.center,
-              child: const Icon(Icons.fastfood,
-                  color: Colors.blue, size: 30),
+            child: Text(
+              "+${cart[item["name"]]}",
+              style: GoogleFonts.poppins(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
             ),
-          )
-        : Container(
-            color: Colors.blue.shade50,
-            alignment: Alignment.center, // ✅ CENTER FIX
-            child: const Icon(Icons.fastfood,
-                color: Colors.blue, size: 30),
           ),
+        ),
+    ],
   ),
 ),
             const SizedBox(height: 8),
