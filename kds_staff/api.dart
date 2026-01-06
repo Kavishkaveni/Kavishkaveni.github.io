@@ -80,14 +80,14 @@ static Future<void> updateOrderStatus({
   }
 }
 
-  // ================= NEXT STATUS HELPER =================
+  /* ================= NEXT STATUS HELPER =================
   /// Determines next KDS status based on current status
   static String? getNextStatus(String currentStatus) {
     switch (currentStatus) {
       case 'pending':
         return 'in-progress'; // Accept
       case 'in-progress':
-        return 'completed'; // Done (or change to 'preparing' if needed)
+        return 'completed'; 
       case 'preparing':
         return 'completed';
       default:
@@ -95,7 +95,7 @@ static Future<void> updateOrderStatus({
     }
   }
 
-  // ================= ADVANCE ORDER STATUS =================
+  ================= ADVANCE ORDER STATUS =================
   /// Advances order to next logical KDS state
   static Future<void> advanceOrderStatus({
     required String orderId,
@@ -111,5 +111,29 @@ static Future<void> updateOrderStatus({
       orderId: orderId,
       status: nextStatus,
     );
+  }*/
+
+  // ================= WORKFLOW CONFIG (STAFF) =================
+// ================= GET WORKFLOW CONFIG =================
+static Future<Map<String, dynamic>> getWorkflowConfig() async {
+  final url = Uri.parse('$_baseUrl/workflow/config');
+
+  final response = await http.get(
+    url,
+    headers: _headers(),
+  );
+
+  if (response.statusCode != 200) {
+    print('WF CONFIG STATUS: ${response.statusCode}');
+    print('WF CONFIG BODY: ${response.body}');
+    throw Exception('Failed to load workflow config');
   }
+
+  final data = jsonDecode(response.body);
+
+  return {
+    'config': data['config'],
+    'actions': List<Map<String, dynamic>>.from(data['actions'] ?? []),
+  };
+}
 }
