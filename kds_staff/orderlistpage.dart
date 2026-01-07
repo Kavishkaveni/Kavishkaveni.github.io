@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+
 import '../kds_staff/order_detail_page.dart';
+import '../kds_staff/order_grid_page.dart';
 import '../services/kds_api.dart';
 
 class KdsOrderListPage extends StatefulWidget {
@@ -14,6 +16,14 @@ class KdsOrderListPage extends StatefulWidget {
 
 class _KdsOrderListPageState extends State<KdsOrderListPage> {
   // ================= STATE =================
+  Map<String, dynamic>? workflowConfig;
+List<Map<String, dynamic>> workflowActions = [];
+
+String searchText = '';
+String selectedStatus = 'all'; // default
+
+bool isGridView = false; // false = List, true = Grid
+
   bool loading = true;
   String? kitchenName;
   int? kitchenId;
@@ -59,6 +69,19 @@ class _KdsOrderListPageState extends State<KdsOrderListPage> {
       kitchenId = selectedKitchen['id'];
       kitchenName = selectedKitchen['name'];
 
+      try {
+  final wf = await KdsApi.getWorkflowConfig();
+  workflowConfig = wf['config'];
+  workflowActions = List<Map<String, dynamic>>.from(wf['actions'] ?? [])
+      .where((a) => a['is_active'] == true)
+      .toList()
+    ..sort((a, b) => (a['sequence'] ?? 0).compareTo(b['sequence'] ?? 0));
+} catch (e) {
+  debugPrint("WORKFLOW CONFIG FAILED: $e");
+  workflowConfig = null;
+  workflowActions = [];
+}
+
       final orderList = await KdsApi.getActiveOrders(
         kitchenId: kitchenId!,
         excludeCompleted: true,
@@ -67,9 +90,14 @@ class _KdsOrderListPageState extends State<KdsOrderListPage> {
       if (!mounted) return;
 
       setState(() {
-        orders = orderList;
-        loading = false;
-      });
+  orders = orderList.where((o) {
+    final kds = (o['kds_status'] ?? '').toString();
+    final pay = (o['payment_status'] ?? '').toString();
+    return !(kds == 'completed' && pay == 'completed');
+  }).toList();
+
+  loading = false;
+});
     } catch (e) {
       debugPrint('KDS ORDER LIST ERROR: $e');
       if (mounted) setState(() => loading = false);
@@ -92,21 +120,54 @@ class _KdsOrderListPageState extends State<KdsOrderListPage> {
 
       // ---------- APP BAR ----------
       appBar: AppBar(
-        backgroundColor: Colors.white,
-        elevation: 0,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.black),
-          onPressed: () => Navigator.pop(context),
-        ),
-        centerTitle: true,
-        title: Text(
-          'KDS',
-          style: GoogleFonts.poppins(
-            fontWeight: FontWeight.w600,
-            color: Colors.black,
-          ),
+  backgroundColor: Colors.white,
+  elevation: 0,
+  leading: IconButton(
+    icon: const Icon(Icons.arrow_back, color: Colors.black),
+    onPressed: () => Navigator.pop(context),
+  ),
+  centerTitle: true,
+  title: Text(
+    'KDS',
+    style: GoogleFonts.poppins(
+      fontWeight: FontWeight.w600,
+      color: Colors.black,
+    ),
+  ),
+
+  actions: [
+    IconButton(
+      icon: Icon(
+        Icons.list,
+        color: isGridView ? Colors.grey : Colors.blue,
+      ),
+      onPressed: () {
+        setState(() => isGridView = false);
+      },
+    ),
+    IconButton(
+  icon: Icon(
+    Icons.grid_view,
+    color: Colors.blue,
+  ),
+  onPressed: () async {
+    if (kitchenId == null) return;
+
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => KdsOrderGridPage(
+          kitchenId: kitchenId!,
+          workflowActions: workflowActions,
         ),
       ),
+    );
+
+    await loadOrders(); // refresh when coming back
+  },
+),
+  ],
+),
 
       // ---------- BODY ----------
       body: loading
@@ -116,17 +177,12 @@ class _KdsOrderListPageState extends State<KdsOrderListPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Kitchen name
-                  if (kitchenName != null)
-                    Text(
-                      'Kitchen: $kitchenName',
-                      style: GoogleFonts.poppins(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
 
                   const SizedBox(height: 16),
+
+                  
+
+                  
 
                   // ================= TABLET WALL SCREEN =================
                   if (isTablet)
@@ -213,45 +269,75 @@ class _KdsOrderListPageState extends State<KdsOrderListPage> {
 
   // ================= MOBILE CARD =================
   Widget mobileOrderCard(Map<String, dynamic> order) {
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(
-          color: statusColor(order['kds_status']),
-          width: 2,
+  final kds = (order['kds_status'] ?? '').toString();
+  final pay = (order['payment_status'] ?? '').toString();
+
+  return Card(
+    margin: const EdgeInsets.only(bottom: 8),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(10),
+      side: BorderSide(color: statusColor(kds), width: 1.5),
+    ),
+    child: ListTile(
+      dense: true,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+
+      title: Text(
+        'Order #${order['id']}',
+        style: GoogleFonts.poppins(
+          fontSize: 14,
+          fontWeight: FontWeight.w600,
         ),
       ),
-      child: ListTile(
-        dense: true,
-        visualDensity: VisualDensity.compact,
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        title: Text(
-          'Order ID: ${order['id']}',
-          style: GoogleFonts.poppins(fontWeight: FontWeight.w600),
-        ),
-        subtitle: Text(
-          order['table'] ?? '',
-          style: GoogleFonts.poppins(fontSize: 13),
-        ),
-        trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-        onTap: () async {
-  final changed = await Navigator.push<bool>(
-    context,
-    MaterialPageRoute(
-      builder: (_) => KdsOrderDetailPage(order: order),
+
+      subtitle: Text(
+        'Status: ${kds.toUpperCase()} | Payment: ${pay.toUpperCase()}',
+        style: GoogleFonts.poppins(fontSize: 12),
+      ),
+
+      trailing: const Icon(Icons.arrow_forward_ios, size: 14),
+
+      onTap: () async {
+        final changed = await showDialog<bool>(
+  context: context,
+  barrierDismissible: false,
+  builder: (_) => Dialog(
+    insetPadding: const EdgeInsets.all(12),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(16),
+    ),
+    child: KdsOrderDetailPage(
+      order: order,
+      workflowActions: workflowActions,
+    ),
+  ),
+);
+        if (changed == true) await loadOrders();
+      },
     ),
   );
+}
 
-  if (changed == true) {
-    await loadOrders(); // refresh after status update
-  }
-},
+Widget _statusChip({
+  required String label,
+  required Color color,
+}) {
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.15),
+      borderRadius: BorderRadius.circular(20),
+    ),
+    child: Text(
+      label,
+      style: GoogleFonts.poppins(
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+        color: color,
       ),
-    );
-  }
-
+    ),
+  );
+}
   // ================= TABLET WALL CARD =================
 Widget tabletOrderCard(Map<String, dynamic> order) {
   return Card(
@@ -307,23 +393,48 @@ Widget tabletOrderCard(Map<String, dynamic> order) {
           const SizedBox(height: 12),
 
           // ACTION BUTTON
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton(
-              onPressed: () async {
-                await KdsApi.advanceOrderStatus(
-                  orderId: order['id'],
-                  currentStatus: order['kds_status'],
-                );
-                await loadOrders();
-              },
-              child: Text(
-                actionText(order['kds_status']),
-              ),
-            ),
-          ),
+          buildActionButton(order),
         ],
       ),
+    ),
+  );
+}
+
+Widget buildActionButton(Map<String, dynamic> order) {
+  if (workflowActions.isEmpty) return const SizedBox();
+
+  final currentKey = (order['kds_status'] ?? '').toString();
+
+  // Find current action index
+  final currentIndex =
+      workflowActions.indexWhere((a) => a['action_key'] == currentKey);
+
+  // If not found OR already terminal OR no next step => no button
+  if (currentIndex == -1) return const SizedBox();
+  if (workflowActions[currentIndex]['is_terminal'] == true) return const SizedBox();
+  if (currentIndex + 1 >= workflowActions.length) return const SizedBox();
+
+  final nextAction = workflowActions[currentIndex + 1];
+
+  final String nextKey = (nextAction['action_key'] ?? '').toString();
+  final String nextLabel = (nextAction['label'] ?? '').toString();
+  final String nextIcon = (nextAction['icon'] ?? '').toString();
+  final String nextColorHex = (nextAction['color'] ?? '#6c757d').toString();
+
+  return SizedBox(
+    width: double.infinity,
+    child: ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: Color(int.parse(nextColorHex.replaceFirst('#', '0xff'))),
+      ),
+      onPressed: () async {
+        await KdsApi.updateOrderStatus(
+          orderId: order['id'].toString(),
+          status: nextKey,
+        );
+        await loadOrders();
+      },
+      child: Text('$nextIcon $nextLabel'),
     ),
   );
 }
